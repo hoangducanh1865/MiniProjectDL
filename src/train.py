@@ -20,18 +20,23 @@ logger = logging.getLogger(__name__)
 
 def get_device() -> torch.device:
     """
-    Safe device selection.
-    MPS (Apple Silicon) can segfault with certain ops → always use CPU.
-    CUDA is used only if available and not on Apple Silicon.
+    Safe device selection:
+      - Apple Silicon (M1/M2): force CPU — MPS segfaults with certain ops
+      - CUDA available: use GPU
+      - Otherwise: CPU
     """
     import platform
     is_apple_silicon = (platform.system() == "Darwin" and
                         platform.machine() == "arm64")
     if is_apple_silicon:
-        # MPS can segfault; CPU is safer and fast enough on M1/M2
+        logger.info("Apple Silicon detected → using CPU (MPS disabled for stability)")
         return torch.device("cpu")
     if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        logger.info(f"CUDA detected → using GPU: {name}")
         return torch.device("cuda")
+    logger.warning("No GPU detected → using CPU. "
+                   "On Colab: Runtime → Change runtime type → GPU")
     return torch.device("cpu")
 
 
