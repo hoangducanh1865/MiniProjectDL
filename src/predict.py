@@ -6,25 +6,42 @@ import joblib
 import logging
 
 from src.model import ICUMortalityMLP
-from src.train import apply_preprocessor
+from src.train import apply_preprocessor, get_device
 from src.utils import build_feature_matrix
 
 logger = logging.getLogger(__name__)
 
 
-def predict(test_data, model_dir, output_csv="group1.csv",
-            threshold=0.5, mlp_weight=0.5, cb_weight=0.5):
+def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
     """
-    Load all fold models, run inference, average predictions,
-    and write the output CSV.
+    Load the best fold model (by val AUC), run inference, save CSV.
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
+
+    # Determine best fold
+    best_fold_path = os.path.join(model_dir, "best_fold.pkl")
+    if os.path.exists(best_fold_path):
+        info = joblib.load(best_fold_path)
+        best_fold = info["best_fold"]
+        logger.info(f"Using best fold: Fold {best_fold}  (Val AUC={info['best_auc']:.4f})")
+    else:
+        # Fallback: scan available folds and pick highest AUC
+        best_fold, best_auc = 1, 0.0
+        fold = 1
+        while os.path.exists(os.path.join(model_dir, f"model_fold{fold}.pt")):
+            ckpt = torch.load(os.path.join(model_dir, f"model_fold{fold}.pt"),
+                              map_location="cpu")
+            if ckpt.get("fold_auc", 0) > best_auc:
+                best_auc  = ckpt["fold_auc"]
+                best_fold = fold
+            fold += 1
+        logger.info(f"best_fold.pkl not found — scanning folds. "
+                    f"Best: Fold {best_fold} (AUC={best_auc:.4f})")
 
     # Build test feature matrix
     X_test_df = build_feature_matrix(test_data, has_target=False)
-    test_ids = list(X_test_df.index)
+    test_ids  = list(X_test_df.index)
 
-    # Align columns to training columns
     col_names = joblib.load(os.path.join(model_dir, "col_names.pkl"))
     for col in col_names:
         if col not in X_test_df.columns:
@@ -32,51 +49,34 @@ def predict(test_data, model_dir, output_csv="group1.csv",
     X_test_df = X_test_df[col_names]
     X_test_np = X_test_df.values.astype(np.float32)
 
-    # Collect predictions across folds
-    fold_probs_mlp = []
-    fold_probs_cb = []
+    # Load best fold artifacts
+    prep  = joblib.load(os.path.join(model_dir, f"preprocessor_fold{best_fold}.pkl"))
+    ckpt  = torch.load(os.path.join(model_dir, f"model_fold{best_fold}.pt"),
+                       map_location=device)
 
-    fold = 1
-    while True:
-        mlp_path = os.path.join(model_dir, f"mlp_fold{fold}.pt")
-        if not os.path.exists(mlp_path):
-            break
+    X_scaled = apply_preprocessor(X_test_np, prep["imputer"], prep["scaler"])
 
-        prep = joblib.load(os.path.join(model_dir, f"preprocessor_fold{fold}.pkl"))
-        imputer, scaler = prep["imputer"], prep["scaler"]
+    model = ICUMortalityMLP(
+        input_dim   = ckpt["input_dim"],
+        hidden_dims = tuple(ckpt["hidden_dims"]),
+        dropout     = ckpt["dropout"],
+    ).to(device)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
 
-        X_scaled = apply_preprocessor(X_test_np, imputer, scaler)
-        X_imp = imputer.transform(X_test_np)
+    with torch.no_grad():
+        probs = torch.sigmoid(
+            model(torch.tensor(X_scaled, dtype=torch.float32).to(device))
+        ).cpu().numpy()
 
-        # MLP
-        ckpt = torch.load(mlp_path, map_location=device)
-        mlp = ICUMortalityMLP(ckpt["input_dim"]).to(device)
-        mlp.load_state_dict(ckpt["model_state"])
-        mlp.eval()
-        with torch.no_grad():
-            probs_mlp = torch.sigmoid(
-                mlp(torch.tensor(X_scaled).to(device))
-            ).cpu().numpy()
-        fold_probs_mlp.append(probs_mlp)
-
-        # CatBoost
-        cb = joblib.load(os.path.join(model_dir, f"catboost_fold{fold}.pkl"))
-        probs_cb = cb.predict_proba(X_imp)[:, 1]
-        fold_probs_cb.append(probs_cb)
-
-        fold += 1
-
-    avg_mlp = np.mean(fold_probs_mlp, axis=0)
-    avg_cb = np.mean(fold_probs_cb, axis=0)
-    final_probs = mlp_weight * avg_mlp + cb_weight * avg_cb
-    predictions = (final_probs >= threshold).astype(int)
+    predictions = (probs >= threshold).astype(int)
 
     df_out = pd.DataFrame({
-        "id": test_ids,
-        "probability": np.round(final_probs, 6),
-        "prediction": predictions,
+        "id":          test_ids,
+        "probability": np.round(probs, 6),
+        "prediction":  predictions,
     })
     df_out.to_csv(output_csv, index=False)
-    logger.info(f"Saved predictions to {output_csv}  "
-                f"({predictions.sum()} positives / {len(predictions)} total)")
+    logger.info(f"Saved → {output_csv}  "
+                f"({predictions.sum()} positive / {len(predictions)} total)")
     return df_out

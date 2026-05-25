@@ -7,7 +7,6 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import roc_auc_score, average_precision_score
-from catboost import CatBoostClassifier
 import joblib
 import logging
 
@@ -19,12 +18,6 @@ logger = logging.getLogger(__name__)
 
 
 def get_device() -> torch.device:
-    """
-    Safe device selection:
-      - Apple Silicon (M1/M2): force CPU — MPS segfaults with certain ops
-      - CUDA available: use GPU
-      - Otherwise: CPU
-    """
     import platform
     is_apple_silicon = (platform.system() == "Darwin" and
                         platform.machine() == "arm64")
@@ -41,7 +34,7 @@ def get_device() -> torch.device:
 
 
 # ────────────────────────────────────────────────
-# Preprocessing pipeline
+# Preprocessing
 # ────────────────────────────────────────────────
 
 def build_preprocessor(X_train: np.ndarray):
@@ -57,32 +50,55 @@ def apply_preprocessor(X, imputer, scaler):
 
 
 # ────────────────────────────────────────────────
-# MLP training
+# Single-fold MLP training
 # ────────────────────────────────────────────────
 
-def train_mlp(X_train, y_train, X_val, y_val, input_dim,
-              device, epochs=80, batch_size=256, lr=1e-3, seed=42):
+def train_one_fold(
+    X_tr, y_tr, X_val, y_val,
+    input_dim, device,
+    # architecture
+    hidden_dims=(512, 256, 128),
+    dropout=0.3,
+    # optimisation
+    epochs=80,
+    batch_size=256,
+    lr=1e-3,
+    weight_decay=1e-4,
+    # scheduler
+    scheduler_type="cosine",   # "cosine" | "step" | "none"
+    step_size=20,
+    gamma=0.5,
+    # label smoothing
+    label_smoothing=0.05,
+    seed=42,
+):
     set_seed(seed)
 
-    class_counts = np.bincount(y_train.astype(int))
-    weights = 1.0 / class_counts[y_train.astype(int)]
-    # num_workers=0 avoids multiprocessing segfaults on macOS
+    class_counts = np.bincount(y_tr.astype(int))
+    weights = 1.0 / class_counts[y_tr.astype(int)]
     sampler = WeightedRandomSampler(
         torch.tensor(weights, dtype=torch.float64),
         num_samples=len(weights),
         replacement=True,
     )
 
-    train_ds = ICUTabularDataset(X_train, y_train)
-    val_ds = ICUTabularDataset(X_val, y_val)
+    train_ds = ICUTabularDataset(X_tr, y_tr)
+    val_ds   = ICUTabularDataset(X_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=batch_size,
                               sampler=sampler, num_workers=0, pin_memory=False)
-    val_loader = DataLoader(val_ds, batch_size=batch_size * 4,
-                            num_workers=0, pin_memory=False)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size * 4,
+                              num_workers=0, pin_memory=False)
 
-    model = ICUMortalityMLP(input_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    model = ICUMortalityMLP(input_dim, hidden_dims=hidden_dims, dropout=dropout).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif scheduler_type == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    else:
+        scheduler = None
 
     pos_weight = torch.tensor(
         [float(class_counts[0]) / max(float(class_counts[1]), 1)],
@@ -90,19 +106,26 @@ def train_mlp(X_train, y_train, X_val, y_val, input_dim,
     ).to(device)
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    best_auc = 0.0
+    best_auc   = 0.0
     best_state = None
+    history    = []
 
     for epoch in range(1, epochs + 1):
         model.train()
+        epoch_loss = 0.0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
+            # Label smoothing for positive class
+            yb_smooth = yb * (1 - label_smoothing) + 0.5 * label_smoothing
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb)
+            loss = criterion(model(xb), yb_smooth)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-        scheduler.step()
+            epoch_loss += loss.item()
+
+        if scheduler is not None:
+            scheduler.step()
 
         if epoch % 10 == 0 or epoch == epochs:
             model.eval()
@@ -112,128 +135,135 @@ def train_mlp(X_train, y_train, X_val, y_val, input_dim,
                     logits = model(xb.to(device))
                     preds.extend(torch.sigmoid(logits).cpu().numpy().tolist())
             auc = roc_auc_score(y_val, preds)
-            ap = average_precision_score(y_val, preds)
-            logger.info(f"  MLP Epoch {epoch:3d}  Val AUC={auc:.4f}  AP={ap:.4f}")
+            ap  = average_precision_score(y_val, preds)
+            logger.info(f"  Epoch {epoch:3d}  Val AUC={auc:.4f}  AP={ap:.4f}")
+            history.append({"epoch": epoch, "auc": auc, "ap": ap})
             if auc > best_auc:
-                best_auc = auc
+                best_auc   = auc
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
-    return model, best_auc
+    return model, best_auc, history
 
 
 # ────────────────────────────────────────────────
-# CatBoost training
+# Full k-fold training pipeline
 # ────────────────────────────────────────────────
 
-def train_catboost(X_train_raw, y_train, X_val_raw, y_val, seed=42):
-    scale_pos = float(np.sum(y_train == 0)) / max(float(np.sum(y_train == 1)), 1)
-    clf = CatBoostClassifier(
-        iterations=2000,
-        learning_rate=0.03,
-        depth=8,
-        l2_leaf_reg=3,
-        loss_function="Logloss",
-        eval_metric="AUC",
-        scale_pos_weight=scale_pos,
-        early_stopping_rounds=100,
-        random_seed=seed,
-        verbose=200,
-        # Disable GPU on Apple Silicon — use CPU only
-        task_type="CPU",
-        thread_count=-1,
-    )
-    clf.fit(
-        X_train_raw, y_train,
-        eval_set=(X_val_raw, y_val),
-        use_best_model=True,
-    )
-    val_prob = clf.predict_proba(X_val_raw)[:, 1]
-    auc = roc_auc_score(y_val, val_prob)
-    ap = average_precision_score(y_val, val_prob)
-    logger.info(f"  CatBoost  Val AUC={auc:.4f}  AP={ap:.4f}")
-    return clf, auc
-
-
-# ────────────────────────────────────────────────
-# Full training pipeline
-# ────────────────────────────────────────────────
-
-def run_training(X_df, y, output_dir, seed=42, n_folds=5, epochs=80):
+def run_training(
+    X_df, y, output_dir,
+    # CV
+    k_fold=5,
+    seed=42,
+    # architecture
+    hidden_dims=(512, 256, 128),
+    dropout=0.3,
+    # optimisation
+    epochs=80,
+    batch_size=256,
+    lr=1e-3,
+    weight_decay=1e-4,
+    # scheduler
+    scheduler_type="cosine",
+    step_size=20,
+    gamma=0.5,
+    # label smoothing
+    label_smoothing=0.05,
+):
     set_seed(seed)
     os.makedirs(output_dir, exist_ok=True)
 
-    device = get_device()
-    logger.info(f"Device: {device}")
-
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    X_np = X_df.values.astype(np.float32)
+    device  = get_device()
+    skf     = StratifiedKFold(n_splits=k_fold, shuffle=True, random_state=seed)
+    X_np    = X_df.values.astype(np.float32)
     col_names = list(X_df.columns)
 
     fold_results = []
-    oof_probs_mlp = np.zeros(len(y))
-    oof_probs_cb = np.zeros(len(y))
+    oof_probs    = np.zeros(len(y))
+    best_fold_auc = 0.0
+    best_fold_idx = 1
 
     for fold, (tr_idx, val_idx) in enumerate(skf.split(X_np, y), 1):
-        logger.info(f"\n{'='*50}\nFold {fold}/{n_folds}\n{'='*50}")
+        logger.info(f"\n{'='*50}\nFold {fold}/{k_fold}\n{'='*50}")
 
-        X_tr_raw, X_val_raw = X_np[tr_idx], X_np[val_idx]
-        y_tr, y_val = y[tr_idx], y[val_idx]
+        X_tr_raw,  X_val_raw  = X_np[tr_idx], X_np[val_idx]
+        y_tr,      y_val      = y[tr_idx],    y[val_idx]
 
         imputer, scaler, X_tr_scaled = build_preprocessor(X_tr_raw)
         X_val_scaled = apply_preprocessor(X_val_raw, imputer, scaler)
-        X_tr_imp = imputer.transform(X_tr_raw)
-        X_val_imp = imputer.transform(X_val_raw)
 
         input_dim = X_tr_scaled.shape[1]
 
-        mlp, mlp_auc = train_mlp(
+        model, fold_auc, history = train_one_fold(
             X_tr_scaled, y_tr, X_val_scaled, y_val,
-            input_dim, device, epochs=epochs, seed=seed + fold)
-
-        cb, cb_auc = train_catboost(
-            X_tr_imp, y_tr, X_val_imp, y_val, seed=seed + fold)
+            input_dim, device,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            epochs=epochs,
+            batch_size=batch_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            scheduler_type=scheduler_type,
+            step_size=step_size,
+            gamma=gamma,
+            label_smoothing=label_smoothing,
+            seed=seed + fold,
+        )
 
         # OOF predictions
-        mlp.eval()
         with torch.no_grad():
             t = torch.tensor(X_val_scaled, dtype=torch.float32).to(device)
-            oof_probs_mlp[val_idx] = torch.sigmoid(mlp(t)).cpu().numpy()
-        oof_probs_cb[val_idx] = cb.predict_proba(X_val_imp)[:, 1]
+            oof_probs[val_idx] = torch.sigmoid(model(t)).cpu().numpy()
 
-        # Save artifacts
-        torch.save({"model_state": mlp.state_dict(), "input_dim": input_dim},
-                   os.path.join(output_dir, f"mlp_fold{fold}.pt"))
-        joblib.dump(cb, os.path.join(output_dir, f"catboost_fold{fold}.pkl"))
-        joblib.dump({"imputer": imputer, "scaler": scaler},
-                    os.path.join(output_dir, f"preprocessor_fold{fold}.pkl"))
+        # Save fold artifacts
+        torch.save(
+            {"model_state": model.state_dict(),
+             "input_dim": input_dim,
+             "hidden_dims": list(hidden_dims),
+             "dropout": dropout,
+             "fold_auc": fold_auc},
+            os.path.join(output_dir, f"model_fold{fold}.pt"),
+        )
+        joblib.dump(
+            {"imputer": imputer, "scaler": scaler},
+            os.path.join(output_dir, f"preprocessor_fold{fold}.pkl"),
+        )
+        logger.info(f"Fold {fold} saved → model_fold{fold}.pt  (AUC={fold_auc:.4f})")
 
         fold_results.append({
             "fold": fold,
-            "mlp_auc": mlp_auc,
-            "cb_auc": cb_auc,
+            "auc": fold_auc,
             "val_idx": val_idx,
+            "history": history,
         })
 
+        if fold_auc > best_fold_auc:
+            best_fold_auc = fold_auc
+            best_fold_idx = fold
+
+    # Save shared metadata
     joblib.dump(col_names, os.path.join(output_dir, "col_names.pkl"))
+    joblib.dump({"best_fold": best_fold_idx, "best_auc": best_fold_auc},
+                os.path.join(output_dir, "best_fold.pkl"))
 
-    oof_ensemble = 0.5 * oof_probs_mlp + 0.5 * oof_probs_cb
-    oof_auc = roc_auc_score(y, oof_ensemble)
-    oof_ap = average_precision_score(y, oof_ensemble)
+    # OOF evaluation
+    oof_auc = roc_auc_score(y, oof_probs)
+    oof_ap  = average_precision_score(y, oof_probs)
 
-    logger.info(f"\nOOF Ensemble  AUC={oof_auc:.4f}  AUC-PR={oof_ap:.4f}")
-    for res in fold_results:
-        logger.info(f"  Fold {res['fold']}: MLP={res['mlp_auc']:.4f}  CB={res['cb_auc']:.4f}")
+    logger.info(f"\nBest fold: Fold {best_fold_idx}  AUC={best_fold_auc:.4f}")
+    logger.info(f"OOF AUC={oof_auc:.4f}  AUC-PR={oof_ap:.4f}")
+    for r in fold_results:
+        logger.info(f"  Fold {r['fold']}: AUC={r['auc']:.4f}")
 
-    # Persist OOF probabilities for evaluation plots
-    joblib.dump({
-        "oof_probs_mlp": oof_probs_mlp,
-        "oof_probs_cb": oof_probs_cb,
-        "oof_ensemble": oof_ensemble,
-        "y_true": y,
-        "fold_results": fold_results,
-    }, os.path.join(output_dir, "oof_results.pkl"))
+    # Persist OOF data for evaluation plots
+    joblib.dump(
+        {"oof_probs": oof_probs,
+         "y_true": y,
+         "fold_results": fold_results,
+         "best_fold": best_fold_idx},
+        os.path.join(output_dir, "oof_results.pkl"),
+    )
 
     return fold_results, oof_auc, oof_ap

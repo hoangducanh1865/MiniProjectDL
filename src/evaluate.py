@@ -1,16 +1,14 @@
 """
-evaluate.py — Generate evaluation plots from OOF results.
+evaluate.py — Evaluation plots from OOF results (single DL model, k-fold CV).
 
-Plots saved to results/ (or --output-dir):
-  1. roc_curves.png        — ROC curve per fold + ensemble
-  2. pr_curves.png         — Precision-Recall curve per fold + ensemble
-  3. calibration.png       — Calibration plot (reliability diagram)
-  4. score_distribution.png — Predicted probability distribution by class
-  5. fold_comparison.png   — AUC bar chart: MLP vs CatBoost vs Ensemble per fold
-  6. confusion_matrix.png  — Confusion matrix at threshold=0.5
-
-Usage (standalone):
-    python evaluate.py [--model-dir models/] [--output-dir results/]
+Plots saved to results/:
+  1. roc_curves.png          — ROC per fold + OOF overall
+  2. pr_curves.png           — Precision-Recall per fold + OOF overall
+  3. calibration.png         — Reliability diagram
+  4. score_distribution.png  — Score histogram by class
+  5. fold_comparison.png     — AUC bar chart per fold
+  6. confusion_matrix.png    — Confusion matrix at threshold=0.5
+  7. training_history.png    — AUC/AP per epoch for each fold
 """
 
 import os
@@ -18,21 +16,21 @@ import argparse
 import numpy as np
 import joblib
 import matplotlib
-matplotlib.use("Agg")  # non-interactive backend — no display required
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from sklearn.metrics import (
     roc_curve, auc, precision_recall_curve, average_precision_score,
-    roc_auc_score, confusion_matrix, ConfusionMatrixDisplay,
-    brier_score_loss,
+    roc_auc_score, confusion_matrix, ConfusionMatrixDisplay, brier_score_loss,
 )
 from sklearn.calibration import calibration_curve
 import logging
 
 logger = logging.getLogger(__name__)
 
-PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3", "#937860"]
-ENSEMBLE_COLOR = "#2d2d2d"
+PALETTE = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
+           "#937860", "#DA8BC3", "#8C8C8C"]
+BEST_COLOR   = "#e63946"
+OVERALL_COLOR = "#2d2d2d"
 
 
 def _save(fig, path):
@@ -41,185 +39,160 @@ def _save(fig, path):
     logger.info(f"  Saved: {path}")
 
 
-# ── 1. ROC curves ────────────────────────────────────────────────────────────
-
-def plot_roc_curves(fold_results, oof_ensemble, y_true, output_dir):
+def plot_roc_curves(fold_results, oof_probs, y_true, best_fold, output_dir):
     fig, ax = plt.subplots(figsize=(7, 6))
+    for res in fold_results:
+        vi    = res["val_idx"]
+        fpr, tpr, _ = roc_curve(y_true[vi], oof_probs[vi])
+        fold_auc = auc(fpr, tpr)
+        is_best  = res["fold"] == best_fold
+        color    = BEST_COLOR if is_best else PALETTE[res["fold"] % len(PALETTE)]
+        lw       = 2.2 if is_best else 1.0
+        label    = (f"Fold {res['fold']} (AUC={fold_auc:.3f})"
+                    + (" ★ best" if is_best else ""))
+        ax.plot(fpr, tpr, color=color, linewidth=lw, alpha=0.8, label=label)
 
-    for i, res in enumerate(fold_results):
-        val_idx = res["val_idx"]
-        y_v = y_true[val_idx]
-
-        for label, probs, ls in [
-            ("MLP", res.get("oof_mlp", oof_ensemble[val_idx]), "--"),
-            ("CB",  res.get("oof_cb",  oof_ensemble[val_idx]), ":"),
-        ]:
-            fpr, tpr, _ = roc_curve(y_v, probs)
-            fold_auc = auc(fpr, tpr)
-            ax.plot(fpr, tpr, ls, color=PALETTE[i % len(PALETTE)],
-                    alpha=0.5, linewidth=1,
-                    label=f"Fold {res['fold']} {label} (AUC={fold_auc:.3f})")
-
-    fpr_e, tpr_e, _ = roc_curve(y_true, oof_ensemble)
-    ens_auc = auc(fpr_e, tpr_e)
-    ax.plot(fpr_e, tpr_e, "-", color=ENSEMBLE_COLOR, linewidth=2.5,
-            label=f"OOF Ensemble (AUC={ens_auc:.3f})")
-    ax.plot([0, 1], [0, 1], "k--", linewidth=0.8, alpha=0.4)
+    fpr_o, tpr_o, _ = roc_curve(y_true, oof_probs)
+    oof_auc = auc(fpr_o, tpr_o)
+    ax.plot(fpr_o, tpr_o, "--", color=OVERALL_COLOR, linewidth=2.5,
+            label=f"OOF Overall (AUC={oof_auc:.3f})")
+    ax.plot([0, 1], [0, 1], "k:", linewidth=0.8, alpha=0.4)
 
     ax.set_xlabel("False Positive Rate", fontsize=12)
     ax.set_ylabel("True Positive Rate", fontsize=12)
-    ax.set_title("ROC Curves — OOF per Fold + Ensemble", fontsize=13)
-    ax.legend(fontsize=7.5, loc="lower right")
+    ax.set_title("ROC Curves — Per Fold + OOF Overall", fontsize=13)
+    ax.legend(fontsize=8.5, loc="lower right")
     ax.grid(alpha=0.3)
     _save(fig, os.path.join(output_dir, "roc_curves.png"))
 
 
-# ── 2. Precision-Recall curves ───────────────────────────────────────────────
-
-def plot_pr_curves(fold_results, oof_ensemble, y_true, output_dir):
+def plot_pr_curves(fold_results, oof_probs, y_true, best_fold, output_dir):
     fig, ax = plt.subplots(figsize=(7, 6))
     baseline = y_true.mean()
+    for res in fold_results:
+        vi   = res["val_idx"]
+        prec, rec, _ = precision_recall_curve(y_true[vi], oof_probs[vi])
+        ap   = average_precision_score(y_true[vi], oof_probs[vi])
+        is_best = res["fold"] == best_fold
+        color   = BEST_COLOR if is_best else PALETTE[res["fold"] % len(PALETTE)]
+        lw      = 2.2 if is_best else 1.0
+        label   = (f"Fold {res['fold']} (AP={ap:.3f})"
+                   + (" ★ best" if is_best else ""))
+        ax.plot(rec, prec, color=color, linewidth=lw, alpha=0.8, label=label)
 
-    for i, res in enumerate(fold_results):
-        val_idx = res["val_idx"]
-        y_v = y_true[val_idx]
-        probs = res.get("oof_mlp", oof_ensemble[val_idx])
-        prec, rec, _ = precision_recall_curve(y_v, probs)
-        ap = average_precision_score(y_v, probs)
-        ax.plot(rec, prec, "-", color=PALETTE[i % len(PALETTE)],
-                alpha=0.55, linewidth=1,
-                label=f"Fold {res['fold']} MLP (AP={ap:.3f})")
-
-    prec_e, rec_e, _ = precision_recall_curve(y_true, oof_ensemble)
-    ens_ap = average_precision_score(y_true, oof_ensemble)
-    ax.plot(rec_e, prec_e, "-", color=ENSEMBLE_COLOR, linewidth=2.5,
-            label=f"OOF Ensemble (AP={ens_ap:.3f})")
-    ax.axhline(baseline, color="gray", linestyle="--", linewidth=0.9,
-               label=f"Baseline (prevalence={baseline:.2f})")
+    prec_o, rec_o, _ = precision_recall_curve(y_true, oof_probs)
+    oof_ap = average_precision_score(y_true, oof_probs)
+    ax.plot(rec_o, prec_o, "--", color=OVERALL_COLOR, linewidth=2.5,
+            label=f"OOF Overall (AP={oof_ap:.3f})")
+    ax.axhline(baseline, color="gray", linestyle=":", linewidth=0.9,
+               label=f"Baseline prevalence={baseline:.2f}")
 
     ax.set_xlabel("Recall", fontsize=12)
     ax.set_ylabel("Precision", fontsize=12)
-    ax.set_title("Precision-Recall Curves — OOF per Fold + Ensemble", fontsize=13)
-    ax.legend(fontsize=8, loc="upper right")
+    ax.set_title("Precision-Recall Curves — Per Fold + OOF Overall", fontsize=13)
+    ax.legend(fontsize=8.5)
     ax.grid(alpha=0.3)
     _save(fig, os.path.join(output_dir, "pr_curves.png"))
 
 
-# ── 3. Calibration plot ──────────────────────────────────────────────────────
-
-def plot_calibration(oof_probs_mlp, oof_probs_cb, oof_ensemble, y_true, output_dir):
+def plot_calibration(oof_probs, y_true, output_dir):
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot([0, 1], [0, 1], "k--", linewidth=1, label="Perfect calibration")
-
-    for label, probs, color in [
-        ("MLP",      oof_probs_mlp, PALETTE[0]),
-        ("CatBoost", oof_probs_cb,  PALETTE[1]),
-        ("Ensemble", oof_ensemble,  ENSEMBLE_COLOR),
-    ]:
-        frac_pos, mean_pred = calibration_curve(y_true, probs, n_bins=10)
-        bs = brier_score_loss(y_true, probs)
-        lw = 2.5 if label == "Ensemble" else 1.5
-        ax.plot(mean_pred, frac_pos, "o-", color=color, linewidth=lw,
-                label=f"{label} (Brier={bs:.3f})")
-
+    frac_pos, mean_pred = calibration_curve(y_true, oof_probs, n_bins=10)
+    bs = brier_score_loss(y_true, oof_probs)
+    ax.plot(mean_pred, frac_pos, "o-", color=OVERALL_COLOR, linewidth=2,
+            label=f"Model (Brier={bs:.3f})")
     ax.set_xlabel("Mean Predicted Probability", fontsize=12)
     ax.set_ylabel("Fraction of Positives", fontsize=12)
-    ax.set_title("Calibration Plot (Reliability Diagram)", fontsize=13)
+    ax.set_title("Calibration Plot (OOF)", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3)
     _save(fig, os.path.join(output_dir, "calibration.png"))
 
 
-# ── 4. Score distribution ────────────────────────────────────────────────────
-
-def plot_score_distribution(oof_ensemble, y_true, output_dir):
+def plot_score_distribution(oof_probs, y_true, output_dir):
     fig, ax = plt.subplots(figsize=(8, 5))
     bins = np.linspace(0, 1, 41)
-
-    ax.hist(oof_ensemble[y_true == 0], bins=bins, alpha=0.65, color=PALETTE[0],
+    ax.hist(oof_probs[y_true == 0], bins=bins, alpha=0.65, color=PALETTE[0],
             label="Survived (y=0)", density=True)
-    ax.hist(oof_ensemble[y_true == 1], bins=bins, alpha=0.65, color=PALETTE[3],
+    ax.hist(oof_probs[y_true == 1], bins=bins, alpha=0.65, color=PALETTE[3],
             label="Died (y=1)", density=True)
     ax.axvline(0.5, color="black", linestyle="--", linewidth=1.2, label="Threshold=0.5")
-
     ax.set_xlabel("Predicted Mortality Probability", fontsize=12)
     ax.set_ylabel("Density", fontsize=12)
-    ax.set_title("Ensemble Score Distribution by Outcome", fontsize=13)
+    ax.set_title("Score Distribution by Outcome (OOF)", fontsize=13)
     ax.legend(fontsize=11)
     ax.grid(alpha=0.3)
     _save(fig, os.path.join(output_dir, "score_distribution.png"))
 
 
-# ── 5. Fold comparison bar chart ─────────────────────────────────────────────
+def plot_fold_comparison(fold_results, oof_probs, y_true, best_fold, output_dir):
+    folds    = [r["fold"] for r in fold_results]
+    aucs     = [roc_auc_score(y_true[r["val_idx"]], oof_probs[r["val_idx"]])
+                for r in fold_results]
+    colors   = [BEST_COLOR if f == best_fold else PALETTE[i % len(PALETTE)]
+                for i, f in enumerate(folds)]
 
-def plot_fold_comparison(fold_results, oof_probs_mlp, oof_probs_cb,
-                         oof_ensemble, y_true, output_dir):
-    folds = [r["fold"] for r in fold_results]
-    mlp_aucs = [r["mlp_auc"] for r in fold_results]
-    cb_aucs  = [r["cb_auc"]  for r in fold_results]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    bars = ax.bar(range(len(folds)), aucs, color=colors, alpha=0.85, width=0.55)
+    for bar, v in zip(bars, aucs):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.002,
+                f"{v:.4f}", ha="center", va="bottom", fontsize=9)
 
-    # Per-fold ensemble AUC using OOF slice
-    ens_aucs = []
-    for r in fold_results:
-        vi = r["val_idx"]
-        ens_fold = 0.5 * oof_probs_mlp[vi] + 0.5 * oof_probs_cb[vi]
-        ens_aucs.append(roc_auc_score(y_true[vi], ens_fold))
+    oof_auc = roc_auc_score(y_true, oof_probs)
+    ax.axhline(oof_auc, color=OVERALL_COLOR, linestyle="--", linewidth=1.5,
+               label=f"OOF Overall AUC={oof_auc:.4f}")
 
-    x = np.arange(len(folds))
-    width = 0.25
-
-    fig, ax = plt.subplots(figsize=(9, 5))
-    b1 = ax.bar(x - width, mlp_aucs, width, label="MLP",      color=PALETTE[0], alpha=0.85)
-    b2 = ax.bar(x,          cb_aucs,  width, label="CatBoost", color=PALETTE[1], alpha=0.85)
-    b3 = ax.bar(x + width,  ens_aucs, width, label="Ensemble", color=ENSEMBLE_COLOR, alpha=0.85)
-
-    # Overall OOF lines
-    overall_mlp = roc_auc_score(y_true, oof_probs_mlp)
-    overall_cb  = roc_auc_score(y_true, oof_probs_cb)
-    overall_ens = roc_auc_score(y_true, oof_ensemble)
-    ax.axhline(overall_mlp, color=PALETTE[0],    linestyle="--", linewidth=1, alpha=0.7)
-    ax.axhline(overall_cb,  color=PALETTE[1],    linestyle="--", linewidth=1, alpha=0.7)
-    ax.axhline(overall_ens, color=ENSEMBLE_COLOR, linestyle="--", linewidth=1.5)
-
-    for bars in [b1, b2, b3]:
-        for bar in bars:
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.002,
-                    f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=7.5)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels([f"Fold {f}" for f in folds])
-    ax.set_ylabel("AUC-ROC", fontsize=12)
-    ax.set_title("Per-Fold AUC: MLP vs CatBoost vs Ensemble\n"
-                 f"(Overall OOF — MLP: {overall_mlp:.3f}  CB: {overall_cb:.3f}  "
-                 f"Ens: {overall_ens:.3f})", fontsize=12)
+    ax.set_xticks(range(len(folds)))
+    ax.set_xticklabels([f"Fold {f}" + (" ★" if f == best_fold else "")
+                        for f in folds])
+    ax.set_ylabel("Val AUC-ROC", fontsize=12)
+    ax.set_title("Per-Fold Validation AUC (★ = best, used for inference)", fontsize=12)
+    ax.set_ylim(max(0, min(aucs) - 0.05), 1.0)
     ax.legend(fontsize=10)
-    ax.set_ylim(max(0, min(mlp_aucs + cb_aucs + ens_aucs) - 0.05), 1.0)
     ax.grid(axis="y", alpha=0.3)
     _save(fig, os.path.join(output_dir, "fold_comparison.png"))
 
 
-# ── 6. Confusion matrix ──────────────────────────────────────────────────────
-
-def plot_confusion_matrix(oof_ensemble, y_true, output_dir, threshold=0.5):
-    y_pred = (oof_ensemble >= threshold).astype(int)
+def plot_confusion_matrix(oof_probs, y_true, output_dir, threshold=0.5):
+    y_pred = (oof_probs >= threshold).astype(int)
     cm = confusion_matrix(y_true, y_pred)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm,
                                   display_labels=["Survived", "Died"])
     fig, ax = plt.subplots(figsize=(5, 5))
     disp.plot(ax=ax, colorbar=False, cmap="Blues")
-
     tn, fp, fn, tp = cm.ravel()
     sens = tp / max(tp + fn, 1)
     spec = tn / max(tn + fp, 1)
-    ax.set_title(
-        f"Confusion Matrix (threshold={threshold})\n"
-        f"Sensitivity={sens:.3f}  Specificity={spec:.3f}",
-        fontsize=11,
-    )
+    ax.set_title(f"Confusion Matrix (threshold={threshold})\n"
+                 f"Sensitivity={sens:.3f}  Specificity={spec:.3f}", fontsize=11)
     _save(fig, os.path.join(output_dir, "confusion_matrix.png"))
 
 
-# ── Master function ──────────────────────────────────────────────────────────
+def plot_training_history(fold_results, best_fold, output_dir):
+    """Plot val AUC per epoch for each fold."""
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for res in fold_results:
+        history = res.get("history", [])
+        if not history:
+            continue
+        epochs = [h["epoch"] for h in history]
+        aucs   = [h["auc"]   for h in history]
+        is_best = res["fold"] == best_fold
+        color   = BEST_COLOR if is_best else PALETTE[res["fold"] % len(PALETTE)]
+        lw      = 2.5 if is_best else 1.2
+        label   = (f"Fold {res['fold']}"
+                   + (" ★ best" if is_best else ""))
+        ax.plot(epochs, aucs, "o-", color=color, linewidth=lw,
+                markersize=4, alpha=0.85, label=label)
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel("Val AUC-ROC", fontsize=12)
+    ax.set_title("Training History — Val AUC per Epoch", fontsize=13)
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    _save(fig, os.path.join(output_dir, "training_history.png"))
+
 
 def run_evaluation(model_dir: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
@@ -227,39 +200,36 @@ def run_evaluation(model_dir: str, output_dir: str):
     oof_path = os.path.join(model_dir, "oof_results.pkl")
     if not os.path.exists(oof_path):
         raise FileNotFoundError(
-            f"{oof_path} not found. Run training first (python main.py).")
+            f"{oof_path} not found. Run training first.")
 
-    data = joblib.load(oof_path)
-    oof_probs_mlp = data["oof_probs_mlp"]
-    oof_probs_cb  = data["oof_probs_cb"]
-    oof_ensemble  = data["oof_ensemble"]
-    y_true        = data["y_true"]
-    fold_results  = data["fold_results"]
+    data         = joblib.load(oof_path)
+    oof_probs    = data["oof_probs"]
+    y_true       = data["y_true"]
+    fold_results = data["fold_results"]
+    best_fold    = data.get("best_fold", 1)
 
-    # Attach per-fold OOF slices for per-fold plots
+    # Attach per-fold OOF slice
     for res in fold_results:
-        vi = res["val_idx"]
-        res["oof_mlp"] = oof_probs_mlp[vi]
-        res["oof_cb"]  = oof_probs_cb[vi]
+        res["oof_slice"] = oof_probs[res["val_idx"]]
 
-    logger.info(f"Generating evaluation plots → {output_dir}/")
+    logger.info(f"Generating plots → {output_dir}/  (best fold: {best_fold})")
 
-    plot_roc_curves(fold_results, oof_ensemble, y_true, output_dir)
-    plot_pr_curves(fold_results, oof_ensemble, y_true, output_dir)
-    plot_calibration(oof_probs_mlp, oof_probs_cb, oof_ensemble, y_true, output_dir)
-    plot_score_distribution(oof_ensemble, y_true, output_dir)
-    plot_fold_comparison(fold_results, oof_probs_mlp, oof_probs_cb,
-                         oof_ensemble, y_true, output_dir)
-    plot_confusion_matrix(oof_ensemble, y_true, output_dir)
+    plot_roc_curves(fold_results, oof_probs, y_true, best_fold, output_dir)
+    plot_pr_curves(fold_results, oof_probs, y_true, best_fold, output_dir)
+    plot_calibration(oof_probs, y_true, output_dir)
+    plot_score_distribution(oof_probs, y_true, output_dir)
+    plot_fold_comparison(fold_results, oof_probs, y_true, best_fold, output_dir)
+    plot_confusion_matrix(oof_probs, y_true, output_dir)
+    plot_training_history(fold_results, best_fold, output_dir)
 
-    # Print summary
-    ens_auc = roc_auc_score(y_true, oof_ensemble)
-    ens_ap  = average_precision_score(y_true, oof_ensemble)
+    oof_auc = roc_auc_score(y_true, oof_probs)
+    oof_ap  = average_precision_score(y_true, oof_probs)
     logger.info(
         f"\n{'='*45}\n"
-        f"  OOF Ensemble  AUC-ROC = {ens_auc:.4f}\n"
-        f"  OOF Ensemble  AUC-PR  = {ens_ap:.4f}\n"
-        f"  Plots saved to: {output_dir}/\n"
+        f"  OOF AUC-ROC = {oof_auc:.4f}\n"
+        f"  OOF AUC-PR  = {oof_ap:.4f}\n"
+        f"  Best fold   = Fold {best_fold}\n"
+        f"  Plots saved → {output_dir}/\n"
         f"{'='*45}"
     )
 
