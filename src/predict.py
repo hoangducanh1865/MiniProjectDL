@@ -30,7 +30,7 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
         fold = 1
         while os.path.exists(os.path.join(model_dir, f"model_fold{fold}.pt")):
             ckpt = torch.load(os.path.join(model_dir, f"model_fold{fold}.pt"),
-                              map_location="cpu")
+                              map_location="cpu", weights_only=False)
             if ckpt.get("fold_auc", 0) > best_auc:
                 best_auc  = ckpt["fold_auc"]
                 best_fold = fold
@@ -52,7 +52,7 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
     # Load best fold artifacts
     prep  = joblib.load(os.path.join(model_dir, f"preprocessor_fold{best_fold}.pkl"))
     ckpt  = torch.load(os.path.join(model_dir, f"model_fold{best_fold}.pt"),
-                       map_location=device)
+                       map_location=device, weights_only=False)
 
     X_scaled = apply_preprocessor(X_test_np, prep["imputer"], prep["scaler"])
 
