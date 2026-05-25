@@ -1,0 +1,15 @@
+name: mini_project_dl
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scikit-learn
+  - joblib
+  - pip:
+    - torch==2.2.0
+    - catboost==1.2.3
