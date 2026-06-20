@@ -89,6 +89,26 @@ def extract_ts_stats(records: Optional[List[Dict]]) -> Dict[str, float]:
 def extract_features(patient: Dict[str, Any]) -> Dict[str, float]:
     row: Dict[str, float] = {}
 
+    specimen_records = patient.get("specimen") or []
+    specimen_values = [
+        str(r.get("value", "")).upper()
+        for r in specimen_records
+        if isinstance(r, dict)
+    ]
+    specimen_count = len(specimen_values)
+    specimen_art_count = sum(
+        "ART" in value or "ARTERIAL" in value for value in specimen_values
+    )
+    specimen_ven_count = sum("VEN" in value for value in specimen_values)
+    row["specimen_count"] = float(specimen_count)
+    row["specimen_art_count"] = float(specimen_art_count)
+    row["specimen_ven_count"] = float(specimen_ven_count)
+    row["specimen_has_ven"] = float(specimen_ven_count > 0)
+    row["specimen_ven_frac"] = (
+        float(specimen_ven_count) / float(specimen_count)
+        if specimen_count > 0 else np.nan
+    )
+
     # Time-series → statistics
     for feat in TIME_SERIES_FEATURES:
         stats = extract_ts_stats(patient.get(feat))
