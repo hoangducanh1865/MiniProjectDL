@@ -363,6 +363,145 @@ def train_one_fold(
     return model, best_auc, best_ap, best_epoch, history
 
 
+def train_fixed_epochs(
+    X_tr, y_tr, input_dim, device,
+    model_type="mlp",
+    hidden_dims=(192, 96, 48),
+    dropout=0.32,
+    input_dropout=0.04,
+    num_res_blocks=2,
+    transformer_dim=96,
+    transformer_layers=4,
+    transformer_heads=8,
+    epochs=20,
+    batch_size=256,
+    lr=5e-4,
+    weight_decay=1e-4,
+    scheduler_type="cosine",
+    step_size=20,
+    gamma=0.5,
+    label_smoothing=0.05,
+    sampler_type="none",
+    use_pos_weight=True,
+    loss_type="bce",
+    focal_alpha=0.25,
+    focal_gamma=2.0,
+    auc_loss_weight=0.25,
+    auc_margin=1.0,
+    batch_mixup_alpha=0.0,
+    batch_mixup_prob=0.0,
+    ema_decay=0.0,
+    seed=42,
+):
+    set_seed(seed)
+
+    class_counts = np.bincount(y_tr.astype(int))
+    sampler = None
+    if sampler_type == "balanced":
+        weights = 1.0 / class_counts[y_tr.astype(int)]
+        sampler = WeightedRandomSampler(
+            torch.tensor(weights, dtype=torch.float64),
+            num_samples=len(weights),
+            replacement=True,
+        )
+
+    train_ds = ICUTabularDataset(X_tr, y_tr)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=sampler is None,
+        num_workers=0,
+        pin_memory=False,
+    )
+
+    model = build_model(
+        model_type,
+        input_dim=input_dim,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        input_dropout=input_dropout,
+        num_res_blocks=num_res_blocks,
+        transformer_dim=transformer_dim,
+        transformer_layers=transformer_layers,
+        transformer_heads=transformer_heads,
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    if scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    elif scheduler_type == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    elif scheduler_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            epochs=epochs,
+            steps_per_epoch=max(len(train_loader), 1),
+            pct_start=0.2,
+            div_factor=10.0,
+            final_div_factor=100.0,
+        )
+    else:
+        scheduler = None
+    step_scheduler_per_batch = scheduler_type == "onecycle"
+
+    pos_weight = None
+    if use_pos_weight:
+        pos_weight = torch.tensor(
+            [float(class_counts[0]) / max(float(class_counts[1]), 1)],
+            dtype=torch.float32,
+        ).to(device)
+    if loss_type == "focal":
+        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma,
+                              pos_weight=pos_weight)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    ema_state = _make_ema_state(model) if ema_decay > 0 else None
+    for epoch in range(1, epochs + 1):
+        model.train()
+        epoch_loss = 0.0
+        batch_count = 0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            if batch_mixup_alpha > 0 and np.random.rand() < batch_mixup_prob:
+                perm = torch.randperm(xb.size(0), device=device)
+                lam = np.random.beta(batch_mixup_alpha, batch_mixup_alpha)
+                xb = lam * xb + (1.0 - lam) * xb[perm]
+                yb = lam * yb + (1.0 - lam) * yb[perm]
+
+            yb_smooth = yb * (1 - label_smoothing) + 0.5 * label_smoothing
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb_smooth)
+            if loss_type == "bce_auc":
+                loss = loss + auc_loss_weight * pairwise_auc_loss(
+                    logits, yb, margin=auc_margin
+                )
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            if ema_state is not None:
+                _update_ema_state(model, ema_state, ema_decay)
+            if scheduler is not None and step_scheduler_per_batch:
+                scheduler.step()
+            epoch_loss += loss.item()
+            batch_count += 1
+
+        if scheduler is not None and not step_scheduler_per_batch:
+            scheduler.step()
+        logger.info(
+            f"  Final refit epoch {epoch:3d}/{epochs}  "
+            f"loss={epoch_loss / max(batch_count, 1):.4f}"
+        )
+
+    if ema_state is not None:
+        _copy_ema_to_model(model, ema_state)
+    model.eval()
+    return model
+
+
 # ────────────────────────────────────────────────
 # Full k-fold training pipeline
 # ────────────────────────────────────────────────
@@ -374,9 +513,9 @@ def run_training(
     seed=42,
     # architecture
     model_type="mlp",
-    hidden_dims=(256, 128, 64),
-    dropout=0.35,
-    input_dropout=0.05,
+    hidden_dims=(192, 96, 48),
+    dropout=0.32,
+    input_dropout=0.04,
     num_res_blocks=2,
     transformer_dim=96,
     transformer_layers=4,
@@ -409,6 +548,9 @@ def run_training(
     feature_noise_std=0.03,
     feature_mixup_alpha=0.4,
     feature_augment_negatives=False,
+    final_refit=True,
+    final_epochs=None,
+    final_epoch_multiplier=1.15,
     threshold_strategy="youden",
 ):
     set_seed(seed)
@@ -556,5 +698,92 @@ def run_training(
          "threshold_strategy": threshold_strategy},
         os.path.join(output_dir, "oof_results.pkl"),
     )
+
+    if final_refit:
+        best_epochs = [int(r["best_epoch"]) for r in fold_results
+                       if int(r.get("best_epoch", 0)) > 0]
+        if final_epochs is None:
+            refit_epochs = int(np.ceil(np.median(best_epochs) * final_epoch_multiplier))
+            refit_epochs = max(refit_epochs, 1)
+        else:
+            refit_epochs = int(final_epochs)
+
+        logger.info(
+            f"\nFinal refit on 100% train data for {refit_epochs} epochs "
+            f"(median best fold epoch={np.median(best_epochs):.1f})"
+        )
+        imputer, scaler, X_full_scaled = build_preprocessor(X_np)
+        y_full_train = y
+        X_full_scaled, y_full_train = augment_feature_space(
+            X_full_scaled,
+            y_full_train,
+            factor=feature_augment_factor,
+            noise_std=feature_noise_std,
+            mixup_alpha=feature_mixup_alpha,
+            include_negatives=feature_augment_negatives,
+            seed=seed + 9999,
+        )
+        if len(y_full_train) != len(y):
+            logger.info(
+                f"Final fold-safe feature augmentation: "
+                f"{len(y)} → {len(y_full_train)} training rows"
+            )
+
+        final_model = train_fixed_epochs(
+            X_full_scaled,
+            y_full_train,
+            input_dim=X_full_scaled.shape[1],
+            device=device,
+            model_type=model_type,
+            hidden_dims=hidden_dims,
+            dropout=dropout,
+            input_dropout=input_dropout,
+            num_res_blocks=num_res_blocks,
+            transformer_dim=transformer_dim,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
+            epochs=refit_epochs,
+            batch_size=batch_size,
+            lr=lr,
+            weight_decay=weight_decay,
+            scheduler_type=scheduler_type,
+            step_size=step_size,
+            gamma=gamma,
+            label_smoothing=label_smoothing,
+            sampler_type=sampler_type,
+            use_pos_weight=use_pos_weight,
+            loss_type=loss_type,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            auc_loss_weight=auc_loss_weight,
+            auc_margin=auc_margin,
+            batch_mixup_alpha=batch_mixup_alpha,
+            batch_mixup_prob=batch_mixup_prob,
+            ema_decay=ema_decay,
+            seed=seed + 999,
+        )
+        torch.save(
+            {"model_state": final_model.state_dict(),
+             "model_type": model_type,
+             "input_dim": X_full_scaled.shape[1],
+             "hidden_dims": list(hidden_dims),
+             "dropout": dropout,
+             "input_dropout": input_dropout,
+             "num_res_blocks": num_res_blocks,
+             "transformer_dim": transformer_dim,
+             "transformer_layers": transformer_layers,
+             "transformer_heads": transformer_heads,
+             "refit_epochs": refit_epochs},
+            os.path.join(output_dir, "final_model.pt"),
+        )
+        joblib.dump(
+            {"imputer": imputer, "scaler": scaler},
+            os.path.join(output_dir, "preprocessor_final.pkl"),
+        )
+        info = joblib.load(os.path.join(output_dir, "best_fold.pkl"))
+        info["use_final_model"] = True
+        info["final_epochs"] = refit_epochs
+        joblib.dump(info, os.path.join(output_dir, "best_fold.pkl"))
+        logger.info("Final refit model saved → final_model.pt")
 
     return fold_results, oof_auc, oof_ap

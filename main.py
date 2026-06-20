@@ -56,10 +56,10 @@ def parse_args():
     # ── Architecture ──────────────────────────────────────────────────────
     p.add_argument("--model-type", default="mlp",
                    choices=["mlp", "transformer"])
-    p.add_argument("--hidden-dims", type=int, nargs="+", default=[256, 128, 64],
+    p.add_argument("--hidden-dims", type=int, nargs="+", default=[192, 96, 48],
                    help="Hidden layer sizes, e.g. --hidden-dims 512 256 128")
-    p.add_argument("--dropout",     type=float, default=0.35)
-    p.add_argument("--input-dropout", type=float, default=0.05)
+    p.add_argument("--dropout",     type=float, default=0.32)
+    p.add_argument("--input-dropout", type=float, default=0.04)
     p.add_argument("--num-res-blocks", type=int, default=2)
     p.add_argument("--transformer-dim", type=int, default=96)
     p.add_argument("--transformer-layers", type=int, default=4)
@@ -95,6 +95,11 @@ def parse_args():
                    choices=["youden", "f1", "fixed"])
     p.add_argument("--threshold",      type=float, default=None,
                    help="Override inference threshold. Defaults to OOF-tuned threshold.")
+    p.add_argument("--no-final-refit", action="store_true",
+                   help="Disable final refit on 100% train data after CV.")
+    p.add_argument("--final-epochs", type=int, default=None,
+                   help="Fixed epoch count for final refit. Defaults to median best fold epoch.")
+    p.add_argument("--final-epoch-multiplier", type=float, default=1.15)
 
     # ── LR Scheduler ──────────────────────────────────────────────────────
     p.add_argument("--scheduler",  default="cosine",
@@ -152,6 +157,12 @@ def main():
         args.ema_decay = 0.995
         args.feature_augment_factor = max(args.feature_augment_factor, 1)
         args.patience = max(args.patience, 22)
+    else:
+        args.model_type = "mlp"
+        args.hidden_dims = [192, 96, 48]
+        args.dropout = 0.32
+        args.input_dropout = 0.04
+        args.num_res_blocks = 2
 
     provided_model_dir = args.model_dir
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
@@ -250,6 +261,9 @@ def main():
             feature_noise_std = args.feature_noise_std,
             feature_mixup_alpha = args.feature_mixup_alpha,
             feature_augment_negatives = args.feature_augment_negatives,
+            final_refit    = not args.no_final_refit,
+            final_epochs   = args.final_epochs,
+            final_epoch_multiplier = args.final_epoch_multiplier,
             threshold_strategy = args.threshold_strategy,
         )
         logger.info(f"✓ Training done  OOF AUC={oof_auc:.4f}  AUC-PR={oof_ap:.4f}")

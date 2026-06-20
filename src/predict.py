@@ -20,12 +20,14 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=None):
 
     # Determine best fold
     best_fold_path = os.path.join(model_dir, "best_fold.pkl")
+    use_final_model = False
     if os.path.exists(best_fold_path):
         info = joblib.load(best_fold_path)
         best_fold = info["best_fold"]
         logger.info(f"Using best fold: Fold {best_fold}  (Val AUC={info['best_auc']:.4f})")
         if threshold is None:
             threshold = float(info.get("threshold", 0.5))
+        use_final_model = bool(info.get("use_final_model", False))
     else:
         # Fallback: scan available folds and pick highest AUC
         best_fold, best_auc = 1, 0.0
@@ -54,10 +56,17 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=None):
     X_test_df = X_test_df[col_names]
     X_test_np = X_test_df.values.astype(np.float32)
 
-    # Load best fold artifacts
-    prep  = joblib.load(os.path.join(model_dir, f"preprocessor_fold{best_fold}.pkl"))
-    ckpt  = torch.load(os.path.join(model_dir, f"model_fold{best_fold}.pt"),
-                       map_location=device, weights_only=False)
+    final_model_path = os.path.join(model_dir, "final_model.pt")
+    final_prep_path = os.path.join(model_dir, "preprocessor_final.pkl")
+    if use_final_model and os.path.exists(final_model_path) and os.path.exists(final_prep_path):
+        logger.info("Using final refit model trained on 100% train data")
+        prep = joblib.load(final_prep_path)
+        ckpt = torch.load(final_model_path, map_location=device, weights_only=False)
+    else:
+        # Load best fold artifacts
+        prep  = joblib.load(os.path.join(model_dir, f"preprocessor_fold{best_fold}.pkl"))
+        ckpt  = torch.load(os.path.join(model_dir, f"model_fold{best_fold}.pt"),
+                           map_location=device, weights_only=False)
 
     X_scaled = apply_preprocessor(X_test_np, prep["imputer"], prep["scaler"])
 
