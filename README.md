@@ -60,6 +60,32 @@ Smoke test ablation nhanh:
 python ablation.py --fast --variants improved_regularized focal_loss
 ```
 
+Chạy cấu hình mạnh trên A100:
+
+```bash
+RUN=results/$(date +%Y_%m_%d_%H_%M_%S)
+mkdir -p "$RUN"
+python main.py --preset strong_mlp --run-dir "$RUN" 2>&1 | tee "$RUN/train.log"
+```
+
+Thử transformer tabular:
+
+```bash
+RUN=results/$(date +%Y_%m_%d_%H_%M_%S)
+mkdir -p "$RUN"
+python main.py --preset transformer --run-dir "$RUN" 2>&1 | tee "$RUN/train.log"
+```
+
+Ablation các cấu hình mạnh:
+
+```bash
+RUN=results/$(date +%Y_%m_%d_%H_%M_%S)
+mkdir -p "$RUN"
+python ablation.py --run-dir "$RUN" \
+  --variants a100_strong_mlp_auc_aug a100_transformer_auc_aug a100_strong_mlp_no_aug \
+  2>&1 | tee "$RUN/ablation.log"
+```
+
 ## Output
 
 | Path | Nội dung |

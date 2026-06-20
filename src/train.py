@@ -13,7 +13,7 @@ import joblib
 import logging
 
 from src.dataset import ICUTabularDataset
-from src.model import ICUMortalityMLP
+from src.model import build_model
 from src.utils import set_seed
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,93 @@ class FocalLoss(nn.Module):
         return (alpha_t * (1 - pt).pow(self.gamma) * bce).mean()
 
 
+def pairwise_auc_loss(logits, targets, margin=1.0):
+    hard_targets = (targets >= 0.5)
+    pos = logits[hard_targets]
+    neg = logits[~hard_targets]
+    if pos.numel() == 0 or neg.numel() == 0:
+        return logits.new_tensor(0.0)
+    diffs = pos[:, None] - neg[None, :]
+    return nn.functional.softplus(margin - diffs).mean()
+
+
+def augment_feature_space(
+    X, y, factor=0, noise_std=0.03, mixup_alpha=0.4,
+    include_negatives=False, seed=42,
+):
+    """Fold-safe augmentation after split/preprocessing."""
+    if factor <= 0:
+        return X, y
+    rng = np.random.default_rng(seed)
+    X_parts = [X]
+    y_parts = [y]
+
+    classes = [1]
+    if include_negatives:
+        classes.append(0)
+
+    for cls in classes:
+        idx = np.where(y.astype(int) == cls)[0]
+        if len(idx) < 2:
+            continue
+        for _ in range(factor):
+            base_idx = rng.choice(idx, size=len(idx), replace=True)
+            other_idx = rng.choice(idx, size=len(idx), replace=True)
+            lam = rng.beta(mixup_alpha, mixup_alpha, size=(len(idx), 1))
+            mixed = lam * X[base_idx] + (1.0 - lam) * X[other_idx]
+            noise = rng.normal(0.0, noise_std, size=mixed.shape)
+            X_aug = (mixed + noise).astype(np.float32)
+            y_aug = np.full(len(idx), cls, dtype=y.dtype)
+            X_parts.append(X_aug)
+            y_parts.append(y_aug)
+
+    return np.vstack(X_parts).astype(np.float32), np.concatenate(y_parts)
+
+
+def _make_ema_state(model):
+    return {
+        name: param.detach().cpu().clone()
+        for name, param in model.state_dict().items()
+        if torch.is_floating_point(param)
+    }
+
+
+def _update_ema_state(model, ema_state, decay):
+    for name, param in model.state_dict().items():
+        if name in ema_state:
+            ema_state[name].mul_(decay).add_(param.detach().cpu(), alpha=1.0 - decay)
+
+
+def _copy_ema_to_model(model, ema_state):
+    state = model.state_dict()
+    backup = {}
+    for name, value in ema_state.items():
+        backup[name] = state[name].detach().cpu().clone()
+        state[name].copy_(value.to(state[name].device))
+    return backup
+
+
+def _restore_state(model, backup):
+    state = model.state_dict()
+    for name, value in backup.items():
+        state[name].copy_(value.to(state[name].device))
+
+
+def _predict_loader(model, loader, device, ema_state=None):
+    backup = None
+    if ema_state is not None:
+        backup = _copy_ema_to_model(model, ema_state)
+    model.eval()
+    preds = []
+    with torch.no_grad():
+        for xb, _ in loader:
+            logits = model(xb.to(device))
+            preds.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+    if backup is not None:
+        _restore_state(model, backup)
+    return preds
+
+
 def _select_threshold(y_true, probs, strategy="youden"):
     if strategy == "fixed":
         return 0.5
@@ -92,10 +179,14 @@ def train_one_fold(
     X_tr, y_tr, X_val, y_val,
     input_dim, device,
     # architecture
+    model_type="mlp",
     hidden_dims=(256, 128, 64),
     dropout=0.35,
     input_dropout=0.05,
     num_res_blocks=2,
+    transformer_dim=96,
+    transformer_layers=4,
+    transformer_heads=8,
     # optimisation
     epochs=100,
     batch_size=256,
@@ -116,6 +207,11 @@ def train_one_fold(
     loss_type="bce",
     focal_alpha=0.25,
     focal_gamma=2.0,
+    auc_loss_weight=0.25,
+    auc_margin=1.0,
+    batch_mixup_alpha=0.0,
+    batch_mixup_prob=0.0,
+    ema_decay=0.0,
     seed=42,
 ):
     set_seed(seed)
@@ -138,12 +234,16 @@ def train_one_fold(
     val_loader   = DataLoader(val_ds,   batch_size=batch_size * 4,
                               num_workers=0, pin_memory=False)
 
-    model = ICUMortalityMLP(
-        input_dim,
+    model = build_model(
+        model_type,
+        input_dim=input_dim,
         hidden_dims=hidden_dims,
         dropout=dropout,
         input_dropout=input_dropout,
         num_res_blocks=num_res_blocks,
+        transformer_dim=transformer_dim,
+        transformer_layers=transformer_layers,
+        transformer_heads=transformer_heads,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -152,8 +252,19 @@ def train_one_fold(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     elif scheduler_type == "step":
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+    elif scheduler_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            epochs=epochs,
+            steps_per_epoch=max(len(train_loader), 1),
+            pct_start=0.2,
+            div_factor=10.0,
+            final_div_factor=100.0,
+        )
     else:
         scheduler = None
+    step_scheduler_per_batch = scheduler_type == "onecycle"
 
     pos_weight = None
     if use_pos_weight:
@@ -167,6 +278,7 @@ def train_one_fold(
     else:
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
+    ema_state = _make_ema_state(model) if ema_decay > 0 else None
     best_auc   = 0.0
     best_ap    = 0.0
     best_epoch = 0
@@ -180,26 +292,35 @@ def train_one_fold(
         batch_count = 0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
-            # Label smoothing for positive class
+            if batch_mixup_alpha > 0 and np.random.rand() < batch_mixup_prob:
+                perm = torch.randperm(xb.size(0), device=device)
+                lam = np.random.beta(batch_mixup_alpha, batch_mixup_alpha)
+                xb = lam * xb + (1.0 - lam) * xb[perm]
+                yb = lam * yb + (1.0 - lam) * yb[perm]
+
             yb_smooth = yb * (1 - label_smoothing) + 0.5 * label_smoothing
             optimizer.zero_grad()
-            loss = criterion(model(xb), yb_smooth)
+            logits = model(xb)
+            loss = criterion(logits, yb_smooth)
+            if loss_type == "bce_auc":
+                loss = loss + auc_loss_weight * pairwise_auc_loss(
+                    logits, yb, margin=auc_margin
+                )
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            if ema_state is not None:
+                _update_ema_state(model, ema_state, ema_decay)
+            if scheduler is not None and step_scheduler_per_batch:
+                scheduler.step()
             epoch_loss += loss.item()
             batch_count += 1
 
-        if scheduler is not None:
+        if scheduler is not None and not step_scheduler_per_batch:
             scheduler.step()
 
         if epoch % eval_every == 0 or epoch == epochs:
-            model.eval()
-            preds = []
-            with torch.no_grad():
-                for xb, _ in val_loader:
-                    logits = model(xb.to(device))
-                    preds.extend(torch.sigmoid(logits).cpu().numpy().tolist())
+            preds = _predict_loader(model, val_loader, device, ema_state=ema_state)
             auc = roc_auc_score(y_val, preds)
             ap  = average_precision_score(y_val, preds)
             train_loss = epoch_loss / max(batch_count, 1)
@@ -217,7 +338,15 @@ def train_one_fold(
                 best_auc   = auc
                 best_ap    = ap
                 best_epoch = epoch
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                if ema_state is not None:
+                    best_state = {
+                        k: v.clone() if k in ema_state else v.cpu().clone()
+                        for k, v in model.state_dict().items()
+                    }
+                    for name, value in ema_state.items():
+                        best_state[name] = value.clone()
+                else:
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 epochs_without_improvement = 0
             else:
                 epochs_without_improvement += eval_every
@@ -244,10 +373,14 @@ def run_training(
     k_fold=5,
     seed=42,
     # architecture
+    model_type="mlp",
     hidden_dims=(256, 128, 64),
     dropout=0.35,
     input_dropout=0.05,
     num_res_blocks=2,
+    transformer_dim=96,
+    transformer_layers=4,
+    transformer_heads=8,
     # optimisation
     epochs=100,
     batch_size=256,
@@ -267,6 +400,15 @@ def run_training(
     loss_type="bce",
     focal_alpha=0.25,
     focal_gamma=2.0,
+    auc_loss_weight=0.25,
+    auc_margin=1.0,
+    batch_mixup_alpha=0.0,
+    batch_mixup_prob=0.0,
+    ema_decay=0.0,
+    feature_augment_factor=0,
+    feature_noise_std=0.03,
+    feature_mixup_alpha=0.4,
+    feature_augment_negatives=False,
     threshold_strategy="youden",
 ):
     set_seed(seed)
@@ -290,16 +432,36 @@ def run_training(
 
         imputer, scaler, X_tr_scaled = build_preprocessor(X_tr_raw)
         X_val_scaled = apply_preprocessor(X_val_raw, imputer, scaler)
+        X_tr_scaled, y_tr_train = augment_feature_space(
+            X_tr_scaled,
+            y_tr,
+            factor=feature_augment_factor,
+            noise_std=feature_noise_std,
+            mixup_alpha=feature_mixup_alpha,
+            include_negatives=feature_augment_negatives,
+            seed=seed + 1000 + fold,
+        )
+        if len(y_tr_train) != len(y_tr):
+            logger.info(
+                f"Fold-safe feature augmentation: "
+                f"{len(y_tr)} → {len(y_tr_train)} training rows"
+            )
+        else:
+            y_tr_train = y_tr
 
         input_dim = X_tr_scaled.shape[1]
 
         model, fold_auc, fold_ap, best_epoch, history = train_one_fold(
-            X_tr_scaled, y_tr, X_val_scaled, y_val,
+            X_tr_scaled, y_tr_train, X_val_scaled, y_val,
             input_dim, device,
+            model_type=model_type,
             hidden_dims=hidden_dims,
             dropout=dropout,
             input_dropout=input_dropout,
             num_res_blocks=num_res_blocks,
+            transformer_dim=transformer_dim,
+            transformer_layers=transformer_layers,
+            transformer_heads=transformer_heads,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
@@ -316,6 +478,11 @@ def run_training(
             loss_type=loss_type,
             focal_alpha=focal_alpha,
             focal_gamma=focal_gamma,
+            auc_loss_weight=auc_loss_weight,
+            auc_margin=auc_margin,
+            batch_mixup_alpha=batch_mixup_alpha,
+            batch_mixup_prob=batch_mixup_prob,
+            ema_decay=ema_decay,
             seed=seed + fold,
         )
 
@@ -327,11 +494,15 @@ def run_training(
         # Save fold artifacts
         torch.save(
             {"model_state": model.state_dict(),
+             "model_type": model_type,
              "input_dim": input_dim,
              "hidden_dims": list(hidden_dims),
              "dropout": dropout,
              "input_dropout": input_dropout,
              "num_res_blocks": num_res_blocks,
+             "transformer_dim": transformer_dim,
+             "transformer_layers": transformer_layers,
+             "transformer_heads": transformer_heads,
              "fold_auc": fold_auc},
             os.path.join(output_dir, f"model_fold{fold}.pt"),
         )

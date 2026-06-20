@@ -49,13 +49,21 @@ def parse_args():
     p.add_argument("--k-fold",  type=int,   default=5,
                    help="Number of CV folds (default: 5)")
     p.add_argument("--seed",    type=int,   default=42)
+    p.add_argument("--preset",  default="regularized",
+                   choices=["regularized", "strong_mlp", "transformer"],
+                   help="Convenience preset for stronger DL configurations")
 
     # ── Architecture ──────────────────────────────────────────────────────
+    p.add_argument("--model-type", default="mlp",
+                   choices=["mlp", "transformer"])
     p.add_argument("--hidden-dims", type=int, nargs="+", default=[256, 128, 64],
                    help="Hidden layer sizes, e.g. --hidden-dims 512 256 128")
     p.add_argument("--dropout",     type=float, default=0.35)
     p.add_argument("--input-dropout", type=float, default=0.05)
     p.add_argument("--num-res-blocks", type=int, default=2)
+    p.add_argument("--transformer-dim", type=int, default=96)
+    p.add_argument("--transformer-layers", type=int, default=4)
+    p.add_argument("--transformer-heads", type=int, default=8)
 
     # ── Optimisation ──────────────────────────────────────────────────────
     p.add_argument("--epochs",        type=int,   default=100)
@@ -71,9 +79,18 @@ def parse_args():
                    choices=["none", "balanced"])
     p.add_argument("--no-pos-weight",  action="store_true")
     p.add_argument("--loss",           default="bce",
-                   choices=["bce", "focal"])
+                   choices=["bce", "focal", "bce_auc"])
     p.add_argument("--focal-alpha",    type=float, default=0.25)
     p.add_argument("--focal-gamma",    type=float, default=2.0)
+    p.add_argument("--auc-loss-weight", type=float, default=0.25)
+    p.add_argument("--auc-margin",      type=float, default=1.0)
+    p.add_argument("--batch-mixup-alpha", type=float, default=0.0)
+    p.add_argument("--batch-mixup-prob",  type=float, default=0.0)
+    p.add_argument("--ema-decay",        type=float, default=0.0)
+    p.add_argument("--feature-augment-factor", type=int, default=0)
+    p.add_argument("--feature-noise-std", type=float, default=0.03)
+    p.add_argument("--feature-mixup-alpha", type=float, default=0.4)
+    p.add_argument("--feature-augment-negatives", action="store_true")
     p.add_argument("--threshold-strategy", default="youden",
                    choices=["youden", "f1", "fixed"])
     p.add_argument("--threshold",      type=float, default=None,
@@ -81,7 +98,7 @@ def parse_args():
 
     # ── LR Scheduler ──────────────────────────────────────────────────────
     p.add_argument("--scheduler",  default="cosine",
-                   choices=["cosine", "step", "none"],
+                   choices=["cosine", "step", "onecycle", "none"],
                    help="LR scheduler (default: cosine)")
     p.add_argument("--step-size",  type=int,   default=20,
                    help="StepLR step size (used when --scheduler=step)")
@@ -101,6 +118,41 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.preset == "strong_mlp":
+        args.model_type = "mlp"
+        args.hidden_dims = [1024, 512, 256, 128]
+        args.dropout = 0.25
+        args.input_dropout = 0.03
+        args.num_res_blocks = 4
+        args.epochs = max(args.epochs, 160)
+        args.lr = 8e-4
+        args.weight_decay = 2e-4
+        args.scheduler = "onecycle"
+        args.loss = "bce_auc"
+        args.auc_loss_weight = 0.20
+        args.batch_mixup_alpha = 0.20
+        args.batch_mixup_prob = 0.35
+        args.ema_decay = 0.995
+        args.feature_augment_factor = max(args.feature_augment_factor, 1)
+        args.patience = max(args.patience, 25)
+    elif args.preset == "transformer":
+        args.model_type = "transformer"
+        args.transformer_dim = max(args.transformer_dim, 128)
+        args.transformer_layers = max(args.transformer_layers, 4)
+        args.transformer_heads = max(args.transformer_heads, 8)
+        args.dropout = 0.12
+        args.epochs = max(args.epochs, 140)
+        args.lr = 5e-4
+        args.weight_decay = 1e-4
+        args.scheduler = "onecycle"
+        args.loss = "bce_auc"
+        args.auc_loss_weight = 0.15
+        args.batch_mixup_alpha = 0.15
+        args.batch_mixup_prob = 0.25
+        args.ema_decay = 0.995
+        args.feature_augment_factor = max(args.feature_augment_factor, 1)
+        args.patience = max(args.patience, 22)
+
     provided_model_dir = args.model_dir
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     run_dir = args.run_dir or os.path.join(args.results_dir, timestamp)
@@ -165,10 +217,14 @@ def main():
             output_dir      = args.model_dir,
             k_fold          = args.k_fold,
             seed            = args.seed,
+            model_type      = args.model_type,
             hidden_dims     = tuple(args.hidden_dims),
             dropout         = args.dropout,
             input_dropout   = args.input_dropout,
             num_res_blocks  = args.num_res_blocks,
+            transformer_dim = args.transformer_dim,
+            transformer_layers = args.transformer_layers,
+            transformer_heads = args.transformer_heads,
             epochs          = args.epochs,
             batch_size      = args.batch_size,
             lr              = args.lr,
@@ -185,6 +241,15 @@ def main():
             loss_type       = args.loss,
             focal_alpha     = args.focal_alpha,
             focal_gamma     = args.focal_gamma,
+            auc_loss_weight = args.auc_loss_weight,
+            auc_margin      = args.auc_margin,
+            batch_mixup_alpha = args.batch_mixup_alpha,
+            batch_mixup_prob  = args.batch_mixup_prob,
+            ema_decay       = args.ema_decay,
+            feature_augment_factor = args.feature_augment_factor,
+            feature_noise_std = args.feature_noise_std,
+            feature_mixup_alpha = args.feature_mixup_alpha,
+            feature_augment_negatives = args.feature_augment_negatives,
             threshold_strategy = args.threshold_strategy,
         )
         logger.info(f"✓ Training done  OOF AUC={oof_auc:.4f}  AUC-PR={oof_ap:.4f}")

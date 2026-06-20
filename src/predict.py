@@ -5,7 +5,7 @@ import torch
 import joblib
 import logging
 
-from src.model import ICUMortalityMLP
+from src.model import build_model
 from src.train import apply_preprocessor, get_device
 from src.utils import build_feature_matrix
 
@@ -61,12 +61,16 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=None):
 
     X_scaled = apply_preprocessor(X_test_np, prep["imputer"], prep["scaler"])
 
-    model = ICUMortalityMLP(
-        input_dim   = ckpt["input_dim"],
-        hidden_dims = tuple(ckpt["hidden_dims"]),
-        dropout     = ckpt["dropout"],
-        input_dropout = ckpt.get("input_dropout", 0.0),
-        num_res_blocks = ckpt.get("num_res_blocks", 2),
+    model = build_model(
+        ckpt.get("model_type", "mlp"),
+        input_dim=ckpt["input_dim"],
+        hidden_dims=tuple(ckpt.get("hidden_dims", [512, 256, 128])),
+        dropout=ckpt.get("dropout", 0.3),
+        input_dropout=ckpt.get("input_dropout", 0.0),
+        num_res_blocks=ckpt.get("num_res_blocks", 2),
+        transformer_dim=ckpt.get("transformer_dim", 96),
+        transformer_layers=ckpt.get("transformer_layers", 4),
+        transformer_heads=ckpt.get("transformer_heads", 8),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
