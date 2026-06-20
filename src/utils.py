@@ -178,22 +178,6 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
                 _safe_ratio(num, den) for num, den in zip(df[a].values, df[b].values)
             ]
 
-    delta_specs = {
-        "heart_rate_delta": ("heart_rate__last", "heart_rate__first"),
-        "resp_rate_delta": ("resp_rate__last", "resp_rate__first"),
-        "spo2_delta": ("spo2__last", "spo2__first"),
-        "pao2fio2_delta": ("pao2fio2ratio__last", "pao2fio2ratio__first"),
-        "lactate_delta": ("lactatebg__last", "lactatebg__first"),
-        "creatinine_delta": ("creatinine__last", "creatinine__first"),
-        "bun_delta": ("bun__last", "bun__first"),
-        "aniongap_delta": ("aniongap__last", "aniongap__first"),
-        "bicarbonate_delta": ("bicarbonate__last", "bicarbonate__first"),
-        "sofa_delta": ("sofa__last", "sofa__first"),
-    }
-    for name, (last_col, first_col) in delta_specs.items():
-        if last_col in df.columns and first_col in df.columns:
-            df[name] = df[last_col] - df[first_col]
-
     # Encode measurement intensity across organ systems. Count features often
     # capture acuity/care-intensity signals that neural nets use well.
     count_cols = [c for c in df.columns if c.endswith("__count")]
@@ -223,19 +207,6 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         "lods_gt_8": ("lods", 8.0),
         "heart_rate_gt_110": ("heart_rate__last", 110.0),
         "resp_rate_gt_24": ("resp_rate__last", 24.0),
-        "lactate_max_gt_2": ("lactatebg__max", 2.0),
-        "lactate_max_gt_4": ("lactatebg__max", 4.0),
-        "creatinine_max_gt_2": ("creatinine__max", 2.0),
-        "bun_max_gt_40": ("bun__max", 40.0),
-        "aniongap_max_gt_16": ("aniongap__max", 16.0),
-        "wbc_max_gt_12": ("wbc__max", 12.0),
-        "inr_max_gt_15": ("inr__max", 1.5),
-        "sofa_max_gt_6": ("sofa__max", 6.0),
-        "sapsii_max_gt_50": ("sapsii__max", 50.0),
-        "heart_rate_max_gt_110": ("heart_rate__max", 110.0),
-        "resp_rate_max_gt_24": ("resp_rate__max", 24.0),
-        "temperature_max_gt_383": ("temperature__max", 38.3),
-        "glucose_max_gt_180": ("glucose__max", 180.0),
     }
     low_specs = {
         "spo2_lt_92": ("spo2__last", 92.0),
@@ -248,16 +219,6 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         "albumin_lt_35": ("albumin__last", 3.5),
         "urineoutput_lt_500": ("urineoutput__mean", 500.0),
         "gcs_min_lt_13": ("gcs_min__mean", 13.0),
-        "spo2_min_lt_92": ("spo2__min", 92.0),
-        "pao2fio2_min_lt_200": ("pao2fio2ratio__min", 200.0),
-        "pao2fio2_min_lt_100": ("pao2fio2ratio__min", 100.0),
-        "ph_min_lt_735": ("ph__min", 7.35),
-        "bicarbonate_min_lt_22": ("bicarbonate__min", 22.0),
-        "platelet_min_lt_150": ("platelet__min", 150.0),
-        "hemoglobin_min_lt_10": ("hemoglobin__min", 10.0),
-        "albumin_min_lt_35": ("albumin__min", 3.5),
-        "gcs_min_min_lt_13": ("gcs_min__min", 13.0),
-        "temperature_min_lt_36": ("temperature__min", 36.0),
     }
     for name, (col, threshold) in high_specs.items():
         if col in df.columns:
@@ -281,30 +242,12 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
             c for c in ["age_gt_80", "lactate_gt_4", "sofa_gt_6", "sapsii_gt_50", "lods_gt_8"]
             if c in flag_df.columns
         ]
-        metabolic_flags = [
-            c for c in [
-                "lactate_max_gt_4", "aniongap_max_gt_16", "ph_min_lt_735",
-                "bicarbonate_min_lt_22", "glucose_max_gt_180"
-            ]
-            if c in flag_df.columns
-        ]
-        heme_flags = [
-            c for c in [
-                "wbc_max_gt_12", "platelet_min_lt_150", "hemoglobin_min_lt_10",
-                "inr_max_gt_15"
-            ]
-            if c in flag_df.columns
-        ]
         if respiratory_flags:
             df["respiratory_risk_flags"] = flag_df[respiratory_flags].sum(axis=1, skipna=True)
         if renal_flags:
             df["renal_risk_flags"] = flag_df[renal_flags].sum(axis=1, skipna=True)
         if global_flags:
             df["global_risk_flags"] = flag_df[global_flags].sum(axis=1, skipna=True)
-        if metabolic_flags:
-            df["metabolic_risk_flags"] = flag_df[metabolic_flags].sum(axis=1, skipna=True)
-        if heme_flags:
-            df["heme_risk_flags"] = flag_df[heme_flags].sum(axis=1, skipna=True)
 
     # Add selected log1p transforms for skewed non-negative clinical variables.
     log_features = {}
