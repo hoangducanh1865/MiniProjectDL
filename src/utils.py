@@ -56,6 +56,14 @@ def _safe_ratio(num, den):
     return float(num) / float(den)
 
 
+def _flag_gt(series: pd.Series, threshold: float) -> pd.Series:
+    return np.where(series.isna(), np.nan, (series > threshold).astype(float))
+
+
+def _flag_lt(series: pd.Series, threshold: float) -> pd.Series:
+    return np.where(series.isna(), np.nan, (series < threshold).astype(float))
+
+
 def extract_ts_stats(records: Optional[List[Dict]]) -> Dict[str, float]:
     if not records:
         return {"mean": np.nan, "std": np.nan, "min": np.nan, "max": np.nan,
@@ -178,6 +186,68 @@ def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
         df["measurement_count_total"] = count_df.sum(axis=1, skipna=True)
         df["measurement_count_nonzero"] = (count_df.fillna(0) > 0).sum(axis=1)
         df["measurement_count_max"] = count_df.max(axis=1, skipna=True)
+
+    # Threshold features give the neural net crisp clinical cut-points while
+    # keeping the original continuous variables available.
+    flags = {}
+    high_specs = {
+        "age_gt_65": ("age_at_admission", 65),
+        "age_gt_80": ("age_at_admission", 80),
+        "duration_gt_48h": ("duration", 48),
+        "bmi_gt_30": ("bmi", 30),
+        "lactate_gt_2": ("lactatebg__last", 2.0),
+        "lactate_gt_4": ("lactatebg__last", 4.0),
+        "creatinine_gt_2": ("creatinine__last", 2.0),
+        "bun_gt_40": ("bun__last", 40.0),
+        "aniongap_gt_16": ("aniongap__last", 16.0),
+        "wbc_gt_12": ("wbc__last", 12.0),
+        "inr_gt_15": ("inr__last", 1.5),
+        "sofa_gt_6": ("sofa__mean", 6.0),
+        "sapsii_gt_50": ("sapsii__mean", 50.0),
+        "lods_gt_8": ("lods", 8.0),
+        "heart_rate_gt_110": ("heart_rate__last", 110.0),
+        "resp_rate_gt_24": ("resp_rate__last", 24.0),
+    }
+    low_specs = {
+        "spo2_lt_92": ("spo2__last", 92.0),
+        "pao2fio2_lt_200": ("pao2fio2ratio__last", 200.0),
+        "pao2fio2_lt_100": ("pao2fio2ratio__last", 100.0),
+        "ph_lt_735": ("ph__last", 7.35),
+        "bicarbonate_lt_22": ("bicarbonate__last", 22.0),
+        "platelet_lt_150": ("platelet__last", 150.0),
+        "hemoglobin_lt_10": ("hemoglobin__last", 10.0),
+        "albumin_lt_35": ("albumin__last", 3.5),
+        "urineoutput_lt_500": ("urineoutput__mean", 500.0),
+        "gcs_min_lt_13": ("gcs_min__mean", 13.0),
+    }
+    for name, (col, threshold) in high_specs.items():
+        if col in df.columns:
+            flags[name] = _flag_gt(df[col], threshold)
+    for name, (col, threshold) in low_specs.items():
+        if col in df.columns:
+            flags[name] = _flag_lt(df[col], threshold)
+
+    if flags:
+        flag_df = pd.DataFrame(flags, index=df.index)
+        df = pd.concat([df, flag_df], axis=1)
+        respiratory_flags = [
+            c for c in ["spo2_lt_92", "pao2fio2_lt_200", "pao2fio2_lt_100", "resp_rate_gt_24"]
+            if c in flag_df.columns
+        ]
+        renal_flags = [
+            c for c in ["creatinine_gt_2", "bun_gt_40", "urineoutput_lt_500"]
+            if c in flag_df.columns
+        ]
+        global_flags = [
+            c for c in ["age_gt_80", "lactate_gt_4", "sofa_gt_6", "sapsii_gt_50", "lods_gt_8"]
+            if c in flag_df.columns
+        ]
+        if respiratory_flags:
+            df["respiratory_risk_flags"] = flag_df[respiratory_flags].sum(axis=1, skipna=True)
+        if renal_flags:
+            df["renal_risk_flags"] = flag_df[renal_flags].sum(axis=1, skipna=True)
+        if global_flags:
+            df["global_risk_flags"] = flag_df[global_flags].sum(axis=1, skipna=True)
 
     # Add selected log1p transforms for skewed non-negative clinical variables.
     log_features = {}
