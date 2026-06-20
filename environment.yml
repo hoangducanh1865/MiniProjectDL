@@ -1,15 +1,18 @@
-name: mini_project_dl
+name: dl
 channels:
   - pytorch
+  - nvidia
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
-  - pip
+  - pytorch==2.2.0
+  - pytorch-cuda=11.8
   - numpy
   - pandas
   - scikit-learn
   - joblib
+  - matplotlib
+  - pip
   - pip:
-    - torch==2.2.0
-    - catboost==1.2.3
+      - catboost==1.2.3
