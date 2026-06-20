@@ -86,6 +86,15 @@ python ablation.py --run-dir "$RUN" \
   2>&1 | tee "$RUN/ablation.log"
 ```
 
+Tìm seed tốt nhất cho một single DL model (không ensemble):
+
+```bash
+RUN=results/$(date +%Y_%m_%d_%H_%M_%S)_seed_search
+mkdir -p "$RUN"
+python seed_search.py --run-dir "$RUN" --seeds 7 21 42 77 123 \
+  2>&1 | tee "$RUN/seed_search.log"
+```
+
 ## Output
 
 | Path | Nội dung |
