@@ -14,6 +14,7 @@ Plots saved to results/:
 import os
 import argparse
 import numpy as np
+import pandas as pd
 import joblib
 import matplotlib
 matplotlib.use("Agg")
@@ -37,6 +38,24 @@ def _save(fig, path):
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     logger.info(f"  Saved: {path}")
+
+
+def _save_table_image(df: pd.DataFrame, path: str, title: str):
+    height = max(2.8, 0.45 * len(df) + 1.2)
+    width = max(7.0, 1.4 * len(df.columns))
+    fig, ax = plt.subplots(figsize=(width, height))
+    ax.axis("off")
+    ax.set_title(title, fontsize=13, pad=12)
+    table = ax.table(
+        cellText=df.astype(str).values,
+        colLabels=df.columns,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1, 1.3)
+    _save(fig, path)
 
 
 def plot_roc_curves(fold_results, oof_probs, y_true, best_fold, output_dir):
@@ -194,6 +213,49 @@ def plot_training_history(fold_results, best_fold, output_dir):
     _save(fig, os.path.join(output_dir, "training_history.png"))
 
 
+def save_metric_tables(fold_results, oof_probs, y_true, output_dir, threshold):
+    y_pred = (oof_probs >= threshold).astype(int)
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / max(tp + fn, 1)
+    specificity = tn / max(tn + fp, 1)
+    precision = tp / max(tp + fp, 1)
+    npv = tn / max(tn + fn, 1)
+    accuracy = (tp + tn) / max(len(y_true), 1)
+
+    summary = pd.DataFrame([{
+        "oof_auc": f"{roc_auc_score(y_true, oof_probs):.4f}",
+        "oof_ap": f"{average_precision_score(y_true, oof_probs):.4f}",
+        "threshold": f"{threshold:.4f}",
+        "accuracy": f"{accuracy:.4f}",
+        "precision": f"{precision:.4f}",
+        "sensitivity": f"{sensitivity:.4f}",
+        "specificity": f"{specificity:.4f}",
+        "npv": f"{npv:.4f}",
+        "tp": int(tp),
+        "fp": int(fp),
+        "tn": int(tn),
+        "fn": int(fn),
+    }])
+    summary.to_csv(os.path.join(output_dir, "metrics_summary.csv"), index=False)
+    _save_table_image(summary, os.path.join(output_dir, "metrics_summary.png"),
+                      "OOF Metrics Summary")
+
+    fold_rows = []
+    for res in fold_results:
+        vi = res["val_idx"]
+        fold_rows.append({
+            "fold": res["fold"],
+            "auc": f"{roc_auc_score(y_true[vi], oof_probs[vi]):.4f}",
+            "ap": f"{average_precision_score(y_true[vi], oof_probs[vi]):.4f}",
+            "best_epoch": res.get("best_epoch", ""),
+        })
+    fold_df = pd.DataFrame(fold_rows)
+    fold_df.to_csv(os.path.join(output_dir, "fold_metrics.csv"), index=False)
+    _save_table_image(fold_df, os.path.join(output_dir, "fold_metrics.png"),
+                      "Per-Fold Metrics")
+
+
 def run_evaluation(model_dir: str, output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
 
@@ -207,6 +269,7 @@ def run_evaluation(model_dir: str, output_dir: str):
     y_true       = data["y_true"]
     fold_results = data["fold_results"]
     best_fold    = data.get("best_fold", 1)
+    threshold    = float(data.get("threshold", 0.5))
 
     # Attach per-fold OOF slice
     for res in fold_results:
@@ -219,8 +282,9 @@ def run_evaluation(model_dir: str, output_dir: str):
     plot_calibration(oof_probs, y_true, output_dir)
     plot_score_distribution(oof_probs, y_true, output_dir)
     plot_fold_comparison(fold_results, oof_probs, y_true, best_fold, output_dir)
-    plot_confusion_matrix(oof_probs, y_true, output_dir)
+    plot_confusion_matrix(oof_probs, y_true, output_dir, threshold=threshold)
     plot_training_history(fold_results, best_fold, output_dir)
+    save_metric_tables(fold_results, oof_probs, y_true, output_dir, threshold)
 
     oof_auc = roc_auc_score(y_true, oof_probs)
     oof_ap  = average_precision_score(y_true, oof_probs)
@@ -229,6 +293,7 @@ def run_evaluation(model_dir: str, output_dir: str):
         f"  OOF AUC-ROC = {oof_auc:.4f}\n"
         f"  OOF AUC-PR  = {oof_ap:.4f}\n"
         f"  Best fold   = Fold {best_fold}\n"
+        f"  Threshold   = {threshold:.4f}\n"
         f"  Plots saved → {output_dir}/\n"
         f"{'='*45}"
     )

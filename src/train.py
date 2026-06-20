@@ -6,7 +6,9 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, precision_recall_curve, roc_curve,
+)
 import joblib
 import logging
 
@@ -49,6 +51,39 @@ def apply_preprocessor(X, imputer, scaler):
     return scaler.transform(imputer.transform(X))
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, pos_weight=None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.pos_weight = pos_weight
+
+    def forward(self, logits, targets):
+        bce = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=self.pos_weight, reduction="none"
+        )
+        probs = torch.sigmoid(logits)
+        pt = probs * targets + (1 - probs) * (1 - targets)
+        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+        return (alpha_t * (1 - pt).pow(self.gamma) * bce).mean()
+
+
+def _select_threshold(y_true, probs, strategy="youden"):
+    if strategy == "fixed":
+        return 0.5
+    if strategy == "f1":
+        precision, recall, thresholds = precision_recall_curve(y_true, probs)
+        if len(thresholds) == 0:
+            return 0.5
+        f1 = 2 * precision[:-1] * recall[:-1] / np.maximum(
+            precision[:-1] + recall[:-1], 1e-12
+        )
+        return float(thresholds[int(np.nanargmax(f1))])
+    fpr, tpr, thresholds = roc_curve(y_true, probs)
+    scores = tpr - fpr
+    return float(thresholds[int(np.nanargmax(scores))])
+
+
 # ────────────────────────────────────────────────
 # Single-fold MLP training
 # ────────────────────────────────────────────────
@@ -57,12 +92,14 @@ def train_one_fold(
     X_tr, y_tr, X_val, y_val,
     input_dim, device,
     # architecture
-    hidden_dims=(512, 256, 128),
-    dropout=0.3,
+    hidden_dims=(256, 128, 64),
+    dropout=0.35,
+    input_dropout=0.05,
+    num_res_blocks=2,
     # optimisation
-    epochs=80,
+    epochs=100,
     batch_size=256,
-    lr=1e-3,
+    lr=5e-4,
     weight_decay=1e-4,
     # scheduler
     scheduler_type="cosine",   # "cosine" | "step" | "none"
@@ -70,26 +107,44 @@ def train_one_fold(
     gamma=0.5,
     # label smoothing
     label_smoothing=0.05,
+    # regularisation / validation
+    eval_every=1,
+    patience=12,
+    min_delta=1e-4,
+    sampler_type="none",
+    use_pos_weight=True,
+    loss_type="bce",
+    focal_alpha=0.25,
+    focal_gamma=2.0,
     seed=42,
 ):
     set_seed(seed)
 
     class_counts = np.bincount(y_tr.astype(int))
-    weights = 1.0 / class_counts[y_tr.astype(int)]
-    sampler = WeightedRandomSampler(
-        torch.tensor(weights, dtype=torch.float64),
-        num_samples=len(weights),
-        replacement=True,
-    )
+    sampler = None
+    if sampler_type == "balanced":
+        weights = 1.0 / class_counts[y_tr.astype(int)]
+        sampler = WeightedRandomSampler(
+            torch.tensor(weights, dtype=torch.float64),
+            num_samples=len(weights),
+            replacement=True,
+        )
 
     train_ds = ICUTabularDataset(X_tr, y_tr)
     val_ds   = ICUTabularDataset(X_val, y_val)
     train_loader = DataLoader(train_ds, batch_size=batch_size,
-                              sampler=sampler, num_workers=0, pin_memory=False)
+                              sampler=sampler, shuffle=sampler is None,
+                              num_workers=0, pin_memory=False)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size * 4,
                               num_workers=0, pin_memory=False)
 
-    model = ICUMortalityMLP(input_dim, hidden_dims=hidden_dims, dropout=dropout).to(device)
+    model = ICUMortalityMLP(
+        input_dim,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        input_dropout=input_dropout,
+        num_res_blocks=num_res_blocks,
+    ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -100,19 +155,29 @@ def train_one_fold(
     else:
         scheduler = None
 
-    pos_weight = torch.tensor(
-        [float(class_counts[0]) / max(float(class_counts[1]), 1)],
-        dtype=torch.float32,
-    ).to(device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    pos_weight = None
+    if use_pos_weight:
+        pos_weight = torch.tensor(
+            [float(class_counts[0]) / max(float(class_counts[1]), 1)],
+            dtype=torch.float32,
+        ).to(device)
+    if loss_type == "focal":
+        criterion = FocalLoss(alpha=focal_alpha, gamma=focal_gamma,
+                              pos_weight=pos_weight)
+    else:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     best_auc   = 0.0
+    best_ap    = 0.0
+    best_epoch = 0
     best_state = None
     history    = []
+    epochs_without_improvement = 0
 
     for epoch in range(1, epochs + 1):
         model.train()
         epoch_loss = 0.0
+        batch_count = 0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
             # Label smoothing for positive class
@@ -123,11 +188,12 @@ def train_one_fold(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_loss += loss.item()
+            batch_count += 1
 
         if scheduler is not None:
             scheduler.step()
 
-        if epoch % 10 == 0 or epoch == epochs:
+        if epoch % eval_every == 0 or epoch == epochs:
             model.eval()
             preds = []
             with torch.no_grad():
@@ -136,16 +202,36 @@ def train_one_fold(
                     preds.extend(torch.sigmoid(logits).cpu().numpy().tolist())
             auc = roc_auc_score(y_val, preds)
             ap  = average_precision_score(y_val, preds)
-            logger.info(f"  Epoch {epoch:3d}  Val AUC={auc:.4f}  AP={ap:.4f}")
-            history.append({"epoch": epoch, "auc": auc, "ap": ap})
-            if auc > best_auc:
+            train_loss = epoch_loss / max(batch_count, 1)
+            logger.info(
+                f"  Epoch {epoch:3d}  loss={train_loss:.4f}  "
+                f"Val AUC={auc:.4f}  AP={ap:.4f}"
+            )
+            history.append({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "auc": auc,
+                "ap": ap,
+            })
+            if auc > best_auc + min_delta:
                 best_auc   = auc
+                best_ap    = ap
+                best_epoch = epoch
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += eval_every
+                if epochs_without_improvement >= patience:
+                    logger.info(
+                        f"  Early stopping at epoch {epoch} "
+                        f"(best epoch {best_epoch}, AUC={best_auc:.4f})"
+                    )
+                    break
 
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
-    return model, best_auc, history
+    return model, best_auc, best_ap, best_epoch, history
 
 
 # ────────────────────────────────────────────────
@@ -158,12 +244,14 @@ def run_training(
     k_fold=5,
     seed=42,
     # architecture
-    hidden_dims=(512, 256, 128),
-    dropout=0.3,
+    hidden_dims=(256, 128, 64),
+    dropout=0.35,
+    input_dropout=0.05,
+    num_res_blocks=2,
     # optimisation
-    epochs=80,
+    epochs=100,
     batch_size=256,
-    lr=1e-3,
+    lr=5e-4,
     weight_decay=1e-4,
     # scheduler
     scheduler_type="cosine",
@@ -171,6 +259,15 @@ def run_training(
     gamma=0.5,
     # label smoothing
     label_smoothing=0.05,
+    eval_every=1,
+    patience=12,
+    min_delta=1e-4,
+    sampler_type="none",
+    use_pos_weight=True,
+    loss_type="bce",
+    focal_alpha=0.25,
+    focal_gamma=2.0,
+    threshold_strategy="youden",
 ):
     set_seed(seed)
     os.makedirs(output_dir, exist_ok=True)
@@ -196,11 +293,13 @@ def run_training(
 
         input_dim = X_tr_scaled.shape[1]
 
-        model, fold_auc, history = train_one_fold(
+        model, fold_auc, fold_ap, best_epoch, history = train_one_fold(
             X_tr_scaled, y_tr, X_val_scaled, y_val,
             input_dim, device,
             hidden_dims=hidden_dims,
             dropout=dropout,
+            input_dropout=input_dropout,
+            num_res_blocks=num_res_blocks,
             epochs=epochs,
             batch_size=batch_size,
             lr=lr,
@@ -209,6 +308,14 @@ def run_training(
             step_size=step_size,
             gamma=gamma,
             label_smoothing=label_smoothing,
+            eval_every=eval_every,
+            patience=patience,
+            min_delta=min_delta,
+            sampler_type=sampler_type,
+            use_pos_weight=use_pos_weight,
+            loss_type=loss_type,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
             seed=seed + fold,
         )
 
@@ -223,6 +330,8 @@ def run_training(
              "input_dim": input_dim,
              "hidden_dims": list(hidden_dims),
              "dropout": dropout,
+             "input_dropout": input_dropout,
+             "num_res_blocks": num_res_blocks,
              "fold_auc": fold_auc},
             os.path.join(output_dir, f"model_fold{fold}.pt"),
         )
@@ -235,6 +344,8 @@ def run_training(
         fold_results.append({
             "fold": fold,
             "auc": fold_auc,
+            "ap": fold_ap,
+            "best_epoch": best_epoch,
             "val_idx": val_idx,
             "history": history,
         })
@@ -245,7 +356,10 @@ def run_training(
 
     # Save shared metadata
     joblib.dump(col_names, os.path.join(output_dir, "col_names.pkl"))
-    joblib.dump({"best_fold": best_fold_idx, "best_auc": best_fold_auc},
+    threshold = _select_threshold(y, oof_probs, strategy=threshold_strategy)
+    joblib.dump({"best_fold": best_fold_idx, "best_auc": best_fold_auc,
+                 "threshold": threshold,
+                 "threshold_strategy": threshold_strategy},
                 os.path.join(output_dir, "best_fold.pkl"))
 
     # OOF evaluation
@@ -254,15 +368,21 @@ def run_training(
 
     logger.info(f"\nBest fold: Fold {best_fold_idx}  AUC={best_fold_auc:.4f}")
     logger.info(f"OOF AUC={oof_auc:.4f}  AUC-PR={oof_ap:.4f}")
+    logger.info(f"OOF threshold ({threshold_strategy}) = {threshold:.4f}")
     for r in fold_results:
-        logger.info(f"  Fold {r['fold']}: AUC={r['auc']:.4f}")
+        logger.info(
+            f"  Fold {r['fold']}: AUC={r['auc']:.4f}  "
+            f"AP={r['ap']:.4f}  best_epoch={r['best_epoch']}"
+        )
 
     # Persist OOF data for evaluation plots
     joblib.dump(
         {"oof_probs": oof_probs,
          "y_true": y,
          "fold_results": fold_results,
-         "best_fold": best_fold_idx},
+         "best_fold": best_fold_idx,
+         "threshold": threshold,
+         "threshold_strategy": threshold_strategy},
         os.path.join(output_dir, "oof_results.pkl"),
     )
 

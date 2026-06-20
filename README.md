@@ -38,6 +38,28 @@ python main.py --evaluate-only
 python main.py --skip-train
 ```
 
+Mỗi lần chạy sẽ tạo một thư mục kết quả riêng:
+
+```
+results/YYYY_MM_DD_HH_MM_SS/
+├── group1.csv
+├── models/
+├── *.png
+└── *_metrics.csv
+```
+
+Chạy ablation deep-learning-only:
+
+```bash
+python ablation.py
+```
+
+Smoke test ablation nhanh:
+
+```bash
+python ablation.py --fast --variants improved_regularized focal_loss
+```
+
 ## Output
 
 | Path | Nội dung |

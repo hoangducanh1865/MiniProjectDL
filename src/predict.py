@@ -12,7 +12,7 @@ from src.utils import build_feature_matrix
 logger = logging.getLogger(__name__)
 
 
-def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
+def predict(test_data, model_dir, output_csv="group1.csv", threshold=None):
     """
     Load the best fold model (by val AUC), run inference, save CSV.
     """
@@ -24,6 +24,8 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
         info = joblib.load(best_fold_path)
         best_fold = info["best_fold"]
         logger.info(f"Using best fold: Fold {best_fold}  (Val AUC={info['best_auc']:.4f})")
+        if threshold is None:
+            threshold = float(info.get("threshold", 0.5))
     else:
         # Fallback: scan available folds and pick highest AUC
         best_fold, best_auc = 1, 0.0
@@ -37,6 +39,9 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
             fold += 1
         logger.info(f"best_fold.pkl not found — scanning folds. "
                     f"Best: Fold {best_fold} (AUC={best_auc:.4f})")
+    if threshold is None:
+        threshold = 0.5
+    logger.info(f"Using classification threshold: {threshold:.4f}")
 
     # Build test feature matrix
     X_test_df = build_feature_matrix(test_data, has_target=False)
@@ -60,6 +65,8 @@ def predict(test_data, model_dir, output_csv="group1.csv", threshold=0.5):
         input_dim   = ckpt["input_dim"],
         hidden_dims = tuple(ckpt["hidden_dims"]),
         dropout     = ckpt["dropout"],
+        input_dropout = ckpt.get("input_dropout", 0.0),
+        num_res_blocks = ckpt.get("num_res_blocks", 2),
     ).to(device)
     model.load_state_dict(ckpt["model_state"])
     model.eval()

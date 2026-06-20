@@ -26,9 +26,12 @@ class ICUMortalityMLP(nn.Module):
     Architecture inspired by TabNet / ResNet-style tabular models.
     """
 
-    def __init__(self, input_dim: int, hidden_dims=(512, 256, 128),
-                 dropout: float = 0.3):
+    def __init__(self, input_dim: int, hidden_dims=(256, 128, 64),
+                 dropout: float = 0.35, input_dropout: float = 0.05,
+                 num_res_blocks: int = 2):
         super().__init__()
+
+        self.input_dropout = nn.Dropout(input_dropout)
 
         layers = [nn.Linear(input_dim, hidden_dims[0]),
                   nn.LayerNorm(hidden_dims[0]),
@@ -48,10 +51,9 @@ class ICUMortalityMLP(nn.Module):
 
         # Residual blocks at the final dimension
         final_dim = hidden_dims[-1]
-        self.res_blocks = nn.Sequential(
-            ResidualBlock(final_dim, dropout),
-            ResidualBlock(final_dim, dropout),
-        )
+        self.res_blocks = nn.Sequential(*[
+            ResidualBlock(final_dim, dropout) for _ in range(num_res_blocks)
+        ])
 
         self.head = nn.Sequential(
             nn.Linear(final_dim, 64),
@@ -61,6 +63,6 @@ class ICUMortalityMLP(nn.Module):
         )
 
     def forward(self, x):
-        h = self.encoder(x)
+        h = self.encoder(self.input_dropout(x))
         h = self.res_blocks(h)
         return self.head(h).squeeze(-1)
