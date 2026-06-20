@@ -42,6 +42,19 @@ STATIC_BINARY_FEATURES = [
 
 SCALAR_FEATURES = ["bmi", "duration", "age_at_admission", "lods"]
 
+LOG_FEATURE_PREFIXES = (
+    "lactatebg__", "creatinine__", "bun__", "glucose__", "wbc__",
+    "platelet__", "aniongap__", "bilirubin_total__", "alt__", "ast__",
+    "alp__", "ld_ldh__", "inr__", "pt__", "ptt__", "urineoutput__",
+    "sapsii__", "sofa__", "duration", "lods", "bmi",
+)
+
+
+def _safe_ratio(num, den):
+    if pd.isna(num) or pd.isna(den) or abs(den) < 1e-8:
+        return np.nan
+    return float(num) / float(den)
+
 
 def extract_ts_stats(records: Optional[List[Dict]]) -> Dict[str, float]:
     if not records:
@@ -110,6 +123,7 @@ def build_feature_matrix(data: Dict[str, Any], has_target: bool = True):
             targets.append(int(patient.get("target", 0)))
 
     df = pd.DataFrame(rows, index=ids)
+    df = add_engineered_features(df)
 
     # Drop columns with >50% missing
     thresh = int(0.5 * len(df))
@@ -117,4 +131,66 @@ def build_feature_matrix(data: Dict[str, Any], has_target: bool = True):
 
     if has_target:
         return df, np.array(targets)
+    return df
+
+
+def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # Clinically motivated interactions. Missing values are kept as NaN so the
+    # fold-local imputer and missingness indicators can handle them safely.
+    specs = {
+        "bun_creatinine_ratio": ("bun__last", "creatinine__last"),
+        "aniongap_bicarbonate_ratio": ("aniongap__last", "bicarbonate__last"),
+        "neutrophil_lymphocyte_ratio": ("neutrophils_abs__last", "lymphocytes_abs__last"),
+        "pao2_spo2_ratio": ("pao2__last", "spo2__last"),
+        "pao2fio2_lactate_ratio": ("pao2fio2ratio__last", "lactatebg__last"),
+        "urineoutput_duration_ratio": ("urineoutput__mean", "duration"),
+        "sofa_sapsii_sum": ("sofa__mean", "sapsii__mean"),
+        "kidney_stress": ("bun__last", "urineoutput__mean"),
+        "oxygenation_stress": ("lactatebg__last", "pao2fio2ratio__last"),
+        "coagulation_stress": ("inr__last", "platelet__last"),
+    }
+
+    for name, (a, b) in specs.items():
+        if a not in df.columns or b not in df.columns:
+            continue
+        if name in {
+            "sofa_sapsii_sum",
+            "kidney_stress",
+            "oxygenation_stress",
+            "coagulation_stress",
+        }:
+            if name == "sofa_sapsii_sum":
+                df[name] = df[a] + df[b]
+            else:
+                df[name] = df[a] * df[b]
+        else:
+            df[name] = [
+                _safe_ratio(num, den) for num, den in zip(df[a].values, df[b].values)
+            ]
+
+    # Encode measurement intensity across organ systems. Count features often
+    # capture acuity/care-intensity signals that neural nets use well.
+    count_cols = [c for c in df.columns if c.endswith("__count")]
+    if count_cols:
+        count_df = df[count_cols]
+        df["measurement_count_total"] = count_df.sum(axis=1, skipna=True)
+        df["measurement_count_nonzero"] = (count_df.fillna(0) > 0).sum(axis=1)
+        df["measurement_count_max"] = count_df.max(axis=1, skipna=True)
+
+    # Add selected log1p transforms for skewed non-negative clinical variables.
+    log_features = {}
+    for col in list(df.columns):
+        if not col.startswith(LOG_FEATURE_PREFIXES):
+            continue
+        series = df[col]
+        finite = series[np.isfinite(series)]
+        if finite.empty or finite.min() < 0:
+            continue
+        log_features[f"{col}__log1p"] = np.log1p(series)
+
+    if log_features:
+        df = pd.concat([df, pd.DataFrame(log_features, index=df.index)], axis=1)
+
     return df

@@ -56,9 +56,9 @@ def parse_args():
     # ── Architecture ──────────────────────────────────────────────────────
     p.add_argument("--model-type", default="mlp",
                    choices=["mlp", "transformer"])
-    p.add_argument("--hidden-dims", type=int, nargs="+", default=[192, 96, 48],
+    p.add_argument("--hidden-dims", type=int, nargs="+", default=[256, 128, 64],
                    help="Hidden layer sizes, e.g. --hidden-dims 512 256 128")
-    p.add_argument("--dropout",     type=float, default=0.32)
+    p.add_argument("--dropout",     type=float, default=0.34)
     p.add_argument("--input-dropout", type=float, default=0.04)
     p.add_argument("--num-res-blocks", type=int, default=2)
     p.add_argument("--transformer-dim", type=int, default=96)
@@ -159,8 +159,8 @@ def main():
         args.patience = max(args.patience, 22)
     else:
         args.model_type = "mlp"
-        args.hidden_dims = [192, 96, 48]
-        args.dropout = 0.32
+        args.hidden_dims = [256, 128, 64]
+        args.dropout = 0.34
         args.input_dropout = 0.04
         args.num_res_blocks = 2
 

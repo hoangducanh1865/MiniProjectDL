@@ -39,15 +39,49 @@ def get_device() -> torch.device:
 # Preprocessing
 # ────────────────────────────────────────────────
 
+class FoldPreprocessor:
+    def __init__(self, clip_quantile=0.005, add_missing_indicators=True):
+        self.clip_quantile = clip_quantile
+        self.add_missing_indicators = add_missing_indicators
+        self.lower_ = None
+        self.upper_ = None
+        self.imputer = SimpleImputer(
+            strategy="median",
+            add_indicator=add_missing_indicators,
+        )
+        self.scaler = StandardScaler()
+
+    def fit_transform(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        self.lower_ = np.nanquantile(X, self.clip_quantile, axis=0)
+        self.upper_ = np.nanquantile(X, 1.0 - self.clip_quantile, axis=0)
+        self.lower_ = np.where(np.isfinite(self.lower_), self.lower_, np.nan)
+        self.upper_ = np.where(np.isfinite(self.upper_), self.upper_, np.nan)
+        X_clip = self._clip(X)
+        X_imp = self.imputer.fit_transform(X_clip)
+        return self.scaler.fit_transform(X_imp)
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=np.float32)
+        X_clip = self._clip(X)
+        X_imp = self.imputer.transform(X_clip)
+        return self.scaler.transform(X_imp)
+
+    def _clip(self, X):
+        lower = np.where(np.isfinite(self.lower_), self.lower_, -np.inf)
+        upper = np.where(np.isfinite(self.upper_), self.upper_, np.inf)
+        return np.clip(X, lower, upper)
+
+
 def build_preprocessor(X_train: np.ndarray):
-    imputer = SimpleImputer(strategy="median")
-    scaler = StandardScaler()
-    X_imp = imputer.fit_transform(X_train)
-    X_scaled = scaler.fit_transform(X_imp)
-    return imputer, scaler, X_scaled
+    preprocessor = FoldPreprocessor(clip_quantile=0.005, add_missing_indicators=True)
+    X_scaled = preprocessor.fit_transform(X_train)
+    return preprocessor, None, X_scaled
 
 
 def apply_preprocessor(X, imputer, scaler):
+    if hasattr(imputer, "transform") and scaler is None:
+        return imputer.transform(X)
     return scaler.transform(imputer.transform(X))
 
 
@@ -366,8 +400,8 @@ def train_one_fold(
 def train_fixed_epochs(
     X_tr, y_tr, input_dim, device,
     model_type="mlp",
-    hidden_dims=(192, 96, 48),
-    dropout=0.32,
+    hidden_dims=(256, 128, 64),
+    dropout=0.34,
     input_dropout=0.04,
     num_res_blocks=2,
     transformer_dim=96,
@@ -513,8 +547,8 @@ def run_training(
     seed=42,
     # architecture
     model_type="mlp",
-    hidden_dims=(192, 96, 48),
-    dropout=0.32,
+    hidden_dims=(256, 128, 64),
+    dropout=0.34,
     input_dropout=0.04,
     num_res_blocks=2,
     transformer_dim=96,
